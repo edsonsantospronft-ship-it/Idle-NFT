@@ -32,6 +32,19 @@ const proceeds = load('proceeds.json', {});
 const accounts = load('accounts.json', {});   // id -> {id, provider, name, nick, created, seen}
 const sessions = load('sessions.json', {});   // token -> {id, t}
 const FEE = 0.05;
+const castle = load('castle.json', { guild: null, champ: null, champPid: null, since: 0, tre: { gold: 0, ruby: 0, cristal: 0 }, buffs: [], titles: [], chestWeek: {}, crbuy: {} });
+const week = () => Math.floor((Date.now() / 864e5 + 3) / 7);
+const spidOf = (pid) => crypto.createHash('sha1').update(String(pid)).digest('hex').slice(0, 12);
+const pubCastle = () => ({ guild: castle.guild, champ: castle.champ, champSpid: castle.champPid ? spidOf(castle.champPid) : '', since: castle.since, tre: castle.tre, buffs: castle.buffs, titles: castle.titles.map(({ pid, ...t }) => t) });
+const crLeft = (pid) => { const r = castle.crbuy[pid]; return 50 - (r && r.w === week() ? r.n : 0); };
+const CR_PRICE = 1000, CR_WEEK = 50;
+// ---------- Cerco ao Castelo (uma arena por bloco) ----------
+const SG_T = 50000, SG_C = 100000, SG_SH = 300, SG_CAP = 30, SG_RESET = 5 * 60 * 1000;
+const SIEGE = {}; const sgOf = (b) => SIEGE[b] || (SIEGE[b] = { t: [SG_T, SG_T, SG_T], sh: SG_SH, cr: SG_C, resetAt: 0, winner: null });
+const sgCount = (b) => { let n = 0; for (const [, p] of clients) if (p.ready && p.m === 11 && p.b === b) n++; return n; };
+function sgBroadcast(b) { const s = sgOf(b); broadcast({ t: 'sg', b, s: { t: s.t, sh: s.sh, cr: s.cr, resetAt: s.resetAt, winner: s.winner, n: sgCount(b) } }, (p) => p.b === b); }
+setInterval(() => { for (const b in SIEGE) if (SIEGE[b].dirty) { SIEGE[b].dirty = false; sgBroadcast(+b); } }, 150);
+setInterval(() => { const now = Date.now(); for (const b in SIEGE) { const s = SIEGE[b]; if (s.resetAt && now >= s.resetAt) { SIEGE[b] = { t: [SG_T, SG_T, SG_T], sh: SG_SH, cr: SG_C, resetAt: 0, winner: null }; sgBroadcast(+b); } } }, 2000);
 const SESSION_DAYS = 60;
 
 const fileOf = (id) => path.join(SAVES, crypto.createHash('sha1').update(id).digest('hex') + '.json');
@@ -185,6 +198,7 @@ wss.on('connection', (ws) => {
         me.lvl = num(d.lvl, 1); me.ready = true;
         const pr = proceeds[me.pid]; if (pr) { delete proceeds[me.pid]; save('proceeds.json', proceeds); }
         send(ws, { t: 'welcome', pid: me.spid, market: publicMarket(), proceeds: pr || null });
+        send(ws, { t: 'castle', c: pubCastle(), crLeft: crLeft(me.pid), chestOk: castle.champPid === me.pid && castle.chestWeek[me.pid] !== week() });
         broadcast({ t: 'chat', ch: 'sys', text: `${me.nick} entrou no mundo.` }, (p) => p !== me);
         break;
       }
@@ -199,6 +213,95 @@ wss.on('connection', (ws) => {
         const text = clean(d.text, 140).trim(); if (!text) return;
         const ch = d.ch === 'local' ? 'local' : 'global';
         broadcast({ t: 'chat', ch, from: me.nick, gtag: me.guild ? me.guild.tag : '', b: me.b, text }, ch === 'local' ? (p) => p.b === me.b && p.m === me.m : null);
+        break;
+      }
+      case 'pvp': case 'pvp_ko': {
+        const dmg = Math.max(1, Math.min(99999, Math.floor(num(d.dmg, 1))));
+        for (const [ws2, p2] of clients) if (p2.spid === d.to && p2.b === me.b && p2.m === me.m) {
+          send(ws2, d.t === 'pvp' ? { t: 'pvp_hit', from: me.nick, fspid: me.spid, dmg } : { t: 'pvp_ko', from: me.nick });
+        }
+        break;
+      }
+      case 'sg_join': {
+        if (!me.guild) return send(ws, { t: 'sg_no', msg: 'Só membros de guilda podem entrar no Cerco ao Castelo.' });
+        if (sgCount(me.b) >= SG_CAP && me.m !== 11) return send(ws, { t: 'sg_no', msg: `A arena do cerco está cheia (${SG_CAP} jogadores). Tente mais tarde.` });
+        const s = sgOf(me.b); send(ws, { t: 'sg_ok', s: { t: s.t, sh: s.sh, cr: s.cr, resetAt: s.resetAt, winner: s.winner, n: sgCount(me.b) } });
+        break;
+      }
+      case 'sg_hit': {
+        if (me.m !== 11 || !me.guild) return; const s = sgOf(me.b); if (s.resetAt) return;
+        const dmg = Math.max(1, Math.min(20000, Math.floor(num(d.dmg, 1)))); const tg = d.tg;
+        if (tg === 't0' || tg === 't1' || tg === 't2') { const i = +tg[1]; if (s.t[i] > 0) s.t[i] = Math.max(0, s.t[i] - dmg); }
+        else if (tg === 'cr') {
+          if (s.t.some((h) => h > 0)) return;
+          if (s.sh > 0) s.sh--; else s.cr = Math.max(0, s.cr - dmg);
+          if (s.cr <= 0) {
+            s.winner = { nick: me.nick, guild: me.guild }; s.resetAt = Date.now() + SG_RESET;
+            castle.guild = me.guild; castle.champ = me.nick; castle.champPid = me.pid; castle.since = Date.now(); castle.buffs = []; castle.titles = [];
+            save('castle.json', castle); broadcast({ t: 'castle', c: pubCastle() });
+            broadcast({ t: 'chat', ch: 'sys', text: `${me.nick} quebrou o Cristal do Cerco! A guilda ${me.guild.name} [${me.guild.tag}] conquistou o castelo.` });
+            send(ws, { t: 'castle', c: pubCastle(), chestOk: castle.chestWeek[me.pid] !== week() });
+          }
+        }
+        s.dirty = true;
+        break;
+      }
+      case 'cs_claim': {
+        return send(ws, { t: 'cs_err', msg: 'O castelo só pode ser conquistado no Cerco.' });
+        castle.guild = me.guild; castle.champ = me.nick; castle.champPid = me.pid; castle.since = Date.now(); castle.buffs = []; castle.titles = [];
+        save('castle.json', castle); broadcast({ t: 'castle', c: pubCastle() });
+        broadcast({ t: 'chat', ch: 'sys', text: `${me.nick} [${me.guild.tag}] conquistou o Trono do Castelo! A guilda ${me.guild.name} agora domina o castelo.` });
+        send(ws, { t: 'castle', c: pubCastle(), chestOk: castle.chestWeek[me.pid] !== week() });
+        break;
+      }
+      case 'cs_buffs': {
+        if (castle.champPid !== me.pid) return send(ws, { t: 'cs_err', msg: 'Só o campeão do castelo escolhe os buffs.' });
+        castle.buffs = [...new Set((d.ids || []).map((x) => num(x, -1) | 0).filter((x) => x >= 0 && x < 50))].slice(0, 5);
+        save('castle.json', castle); broadcast({ t: 'castle', c: pubCastle() });
+        break;
+      }
+      case 'cs_title': {
+        if (castle.champPid !== me.pid) return send(ws, { t: 'cs_err', msg: 'Só o campeão do castelo distribui títulos.' });
+        const tid = num(d.title, -1) | 0; if (tid < 0 || tid >= 50) return;
+        const nick = clean(d.nick, 16).toLowerCase(); let target = null;
+        for (const [, p] of clients) if (p.ready && p.nick.toLowerCase() === nick) target = p;
+        if (!target) return send(ws, { t: 'cs_err', msg: 'Jogador não encontrado online.' });
+        castle.titles = castle.titles.filter((t) => t.pid !== target.pid && t.title !== tid);
+        if (castle.titles.length >= 5) return send(ws, { t: 'cs_err', msg: 'Os 5 títulos já foram distribuídos. Retire um antes.' });
+        castle.titles.push({ pid: target.pid, spid: target.spid, nick: target.nick, title: tid });
+        save('castle.json', castle); broadcast({ t: 'castle', c: pubCastle() });
+        break;
+      }
+      case 'cs_untitle': {
+        if (castle.champPid !== me.pid) return;
+        castle.titles = castle.titles.filter((t) => t.title !== (num(d.title, -1) | 0)); save('castle.json', castle); broadcast({ t: 'castle', c: pubCastle() });
+        break;
+      }
+      case 'cs_wd': {
+        const cur = ['gold', 'ruby', 'cristal'].includes(d.cur) ? d.cur : null; const amt = Math.floor(num(d.amt));
+        if (!cur || amt < 1) return;
+        if (!castle.guild || !me.guild || me.guild.name !== castle.guild.name || !d.leader) return send(ws, { t: 'cs_err', msg: 'Só a liderança da guilda dominante pode sacar do armazém.' });
+        if ((castle.tre[cur] || 0) < amt) return send(ws, { t: 'cs_err', msg: 'O armazém não tem esse valor.' });
+        castle.tre[cur] -= amt; save('castle.json', castle); send(ws, { t: 'cs_wd_ok', cur, amt }); broadcast({ t: 'castle', c: pubCastle() });
+        break;
+      }
+      case 'cs_chest': {
+        if (castle.champPid !== me.pid) return send(ws, { t: 'cs_err', msg: 'Só o campeão do castelo pode abrir o baú real.' });
+        if (castle.chestWeek[me.pid] === week()) return send(ws, { t: 'cs_err', msg: 'O baú real desta semana já foi coletado.' });
+        castle.chestWeek[me.pid] = week(); save('castle.json', castle); send(ws, { t: 'cs_chest_ok' });
+        break;
+      }
+      case 'cr_buy': {
+        const n = Math.max(1, Math.min(50, Math.floor(num(d.n, 1)))); const left = crLeft(me.pid);
+        if (n > left) return send(ws, { t: 'cs_err', msg: `Limite semanal: você ainda pode comprar ${left} cristal(is) esta semana.` });
+        const r = castle.crbuy[me.pid] && castle.crbuy[me.pid].w === week() ? castle.crbuy[me.pid] : (castle.crbuy[me.pid] = { w: week(), n: 0 });
+        r.n += n; castle.tre.gold += Math.floor(n * CR_PRICE * 0.1); save('castle.json', castle);
+        send(ws, { t: 'cr_ok', n, left: crLeft(me.pid) }); broadcast({ t: 'castle', c: pubCastle() });
+        break;
+      }
+      case 'cr_xchg': {
+        const n = Math.max(1, Math.min(100, Math.floor(num(d.n, 1))));
+        castle.tre.cristal += 2 * n; save('castle.json', castle); send(ws, { t: 'xchg_ok', n }); broadcast({ t: 'castle', c: pubCastle() });
         break;
       }
       case 'mk_list': {
@@ -223,6 +326,7 @@ wss.on('connection', (ws) => {
         market.list.splice(i, 1); save('market.json', market);
         send(ws, { t: 'mk_bought', l });
         const net = Math.max(0, Math.floor(l.price * (1 - FEE)));
+        castle.tre[l.cur] = (castle.tre[l.cur] || 0) + (l.price - net); save('castle.json', castle); broadcast({ t: 'castle', c: pubCastle() });
         const sws = byPid(l.pid);
         if (sws) send(sws, { t: 'sold', l, net, buyer: me.nick });
         else { const pr = proceeds[l.pid] || (proceeds[l.pid] = { gold: 0, ruby: 0, sales: [] }); pr[l.cur] += net; pr.sales.push({ uid: l.uid, name: l.id || (l.inst && l.inst.id), q: l.q || 1, net, cur: l.cur, buyer: me.nick }); save('proceeds.json', proceeds); }
