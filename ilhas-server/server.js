@@ -138,6 +138,14 @@ const server = http.createServer(async (req, res) => {
   const p = decodeURIComponent(url.pathname);
   try {
     if (p === '/health') { res.writeHead(200, { 'content-type': 'text/plain' }); return res.end('ok'); }
+    if (p === '/privacidade' || p === '/termos') {
+      const priv = p === '/privacidade';
+      const body = priv
+        ? '<h1>Política de Privacidade — Ilhas do Portal</h1><p>Ao entrar com Google, X ou Telegram, o jogo recebe apenas um identificador da sua conta e o seu nome público, usados somente para salvar o seu personagem. Não coletamos senhas, não vendemos nem compartilhamos dados com terceiros.</p><p>Os dados salvos são: nick, progresso do personagem e anúncios do Mercado Global. Para excluir sua conta e seus dados, fale com o criador do jogo.</p><p>Contato: edsonsantospronft@gmail.com</p>'
+        : '<h1>Termos de Serviço — Ilhas do Portal</h1><p>Ilhas do Portal é um jogo gratuito criado por Edson Bispo Santos. Ao jogar, você concorda em não usar trapaças, não ofender outros jogadores no chat e entende que o jogo pode mudar, ter o progresso reiniciado ou sair do ar a qualquer momento.</p><p>Itens, ouro e rubis não têm valor em dinheiro real.</p><p>Contato: edsonsantospronft@gmail.com</p>';
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      return res.end(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${priv ? 'Privacidade' : 'Termos'} · Ilhas do Portal</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.6;color:#2a1e14;background:#f6ecd8}h1{font-size:24px}a{color:#8a4a1a}</style></head><body>${body}<p><a href="/">Voltar ao jogo</a></p></body></html>`);
+    }
     if (p === '/auth/config') return json(res, 200, { google: CFG.google || null, telegram: CFG.tgBot && CFG.tgToken ? CFG.tgBot : null, x: !!CFG.xId, guest: true });
     if (p === '/auth/x') return xStart(req, res);
     if (p === '/auth/x/callback') return xCallback(req, res, url);
