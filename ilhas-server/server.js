@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
+let QR = null; try { QR = require('qrcode'); } catch { }
 
 const PORT = process.env.PORT || 3000;
 const DATA = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -21,6 +22,12 @@ const CFG = {
   xId: process.env.X_CLIENT_ID || '',
   xSecret: process.env.X_CLIENT_SECRET || '',
   publicUrl: (process.env.PUBLIC_URL || '').replace(/\/$/, ''),
+  mpToken: process.env.MP_ACCESS_TOKEN || '',
+  pixKey: (process.env.PIX_KEY || '').trim(),
+  pixName: (process.env.PIX_NAME || 'EDSON BISPO SANTOS').slice(0, 25),
+  pixCity: (process.env.PIX_CITY || 'SAO PAULO').slice(0, 15),
+  adminKey: process.env.ADMIN_KEY || '',
+  passPrice: Number(process.env.PASS_PRICE || 29.90),
 };
 
 // ---------- persistência simples em JSON ----------
@@ -46,6 +53,40 @@ function sgBroadcast(b) { const s = sgOf(b); broadcast({ t: 'sg', b, s: { t: s.t
 setInterval(() => { for (const b in SIEGE) if (SIEGE[b].dirty) { SIEGE[b].dirty = false; sgBroadcast(+b); } }, 150);
 setInterval(() => { const now = Date.now(); for (const b in SIEGE) { const s = SIEGE[b]; if (s.resetAt && now >= s.resetAt) { SIEGE[b] = { t: [SG_T, SG_T, SG_T], sh: SG_SH, cr: SG_C, resetAt: 0, winner: null }; sgBroadcast(+b); } } }, 2000);
 const SESSION_DAYS = 60;
+const passes = load('passes.json', { orders: {}, grants: {} }); // orders: id -> {acc, nick, mode, status, created, paid}; grants: acc -> {until, pending:[orderId]}
+const PASS_DAYS = 30;
+function grantPass(orderId) {
+  const o = passes.orders[orderId]; if (!o || o.status === 'approved') return;
+  o.status = 'approved'; o.paid = Date.now();
+  const g = passes.grants[o.acc] || (passes.grants[o.acc] = { until: 0, pending: [] });
+  g.until = Math.max(Date.now(), g.until || 0) + PASS_DAYS * 864e5; g.pending.push(orderId);
+  save('passes.json', passes);
+  const ws = byPid(o.acc); if (ws) send(ws, { t: 'pass_ok' });
+}
+// Pix estático (BR Code) com a chave do recebedor
+const emv = (id, v) => id + String(v.length).padStart(2, '0') + v;
+function crc16(str) { let c = 0xFFFF; for (let i = 0; i < str.length; i++) { c ^= str.charCodeAt(i) << 8; for (let j = 0; j < 8; j++) c = (c & 0x8000) ? ((c << 1) ^ 0x1021) & 0xFFFF : (c << 1) & 0xFFFF; } return c.toString(16).toUpperCase().padStart(4, '0'); }
+const noAcc = (s) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z0-9 ]/g, '').toUpperCase();
+function pixPayload(txid, amount) {
+  const mai = emv('00', 'br.gov.bcb.pix') + emv('01', CFG.pixKey);
+  let p = emv('00', '01') + emv('26', mai) + emv('52', '0000') + emv('53', '986') + emv('54', amount.toFixed(2)) + emv('58', 'BR') + emv('59', noAcc(CFG.pixName)) + emv('60', noAcc(CFG.pixCity)) + emv('62', emv('05', txid)) + '6304';
+  return p + crc16(p);
+}
+async function mpCreate(orderId, acc, req) {
+  const body = { transaction_amount: CFG.passPrice, description: 'Passe Mensal - Ilhas do Portal', payment_method_id: 'pix', external_reference: orderId,
+    payer: { email: 'jogador.' + crypto.createHash('sha1').update(acc.id).digest('hex').slice(0, 10) + '@ilhasdoportal.com' },
+    notification_url: baseUrl(req) + '/api/pass/webhook' };
+  const r = await fetch('https://api.mercadopago.com/v1/payments', { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + CFG.mpToken, 'x-idempotency-key': orderId }, body: JSON.stringify(body) });
+  const d = await r.json(); if (!r.ok) throw new Error('Mercado Pago recusou: ' + (d.message || r.status));
+  const td = d.point_of_interaction && d.point_of_interaction.transaction_data || {};
+  return { mpId: d.id, code: td.qr_code, img: td.qr_code_base64 ? 'data:image/png;base64,' + td.qr_code_base64 : null };
+}
+async function mpCheck(o) {
+  if (!CFG.mpToken || !o.mpId) return o.status;
+  const r = await fetch('https://api.mercadopago.com/v1/payments/' + o.mpId, { headers: { authorization: 'Bearer ' + CFG.mpToken } });
+  const d = await r.json(); if (r.ok && d.status === 'approved' && d.external_reference) grantPass(d.external_reference);
+  return passes.orders[o.id] ? passes.orders[o.id].status : o.status;
+}
 
 const fileOf = (id) => path.join(SAVES, crypto.createHash('sha1').update(id).digest('hex') + '.json');
 function readSave(id) { try { return JSON.parse(fs.readFileSync(fileOf(id), 'utf8')); } catch { return null; } }
@@ -64,7 +105,7 @@ function upsert(id, provider, name) {
   const a = accounts[id] || (accounts[id] = { id, provider, name: '', nick: '', created: Date.now() });
   a.name = String(name || a.name || '').slice(0, 40); a.seen = Date.now(); save('accounts.json', accounts); return a;
 }
-const pubAcc = (a) => ({ provider: a.provider, name: a.name, nick: a.nick, hasSave: fs.existsSync(fileOf(a.id)) });
+const pubAcc = (a) => { const g = passes.grants[a.id]; return { provider: a.provider, name: a.name, nick: a.nick, hasSave: fs.existsSync(fileOf(a.id)), pass: g ? { until: g.until, pending: g.pending.length } : null }; };
 
 // ---------- utilidades HTTP ----------
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.webp': 'image/webp', '.json': 'application/json' };
@@ -145,6 +186,47 @@ const server = http.createServer(async (req, res) => {
         : '<h1>Termos de Serviço — Ilhas do Portal</h1><p>Ilhas do Portal é um jogo gratuito criado por Edson Bispo Santos. Ao jogar, você concorda em não usar trapaças, não ofender outros jogadores no chat e entende que o jogo pode mudar, ter o progresso reiniciado ou sair do ar a qualquer momento.</p><p>Itens, ouro e rubis não têm valor em dinheiro real.</p><p>Contato: edsonsantospronft@gmail.com</p>';
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       return res.end(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${priv ? 'Privacidade' : 'Termos'} · Ilhas do Portal</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.6;color:#2a1e14;background:#f6ecd8}h1{font-size:24px}a{color:#8a4a1a}</style></head><body>${body}<p><a href="/">Voltar ao jogo</a></p></body></html>`);
+    }
+    if (p === '/api/pass/info') return json(res, 200, { price: CFG.passPrice, mode: CFG.mpToken ? 'auto' : CFG.pixKey ? 'manual' : null, days: PASS_DAYS });
+    if (req.method === 'POST' && p === '/api/pass/create') {
+      const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Entre com uma conta para comprar o passe.' });
+      const id = 'P' + Date.now().toString(36).toUpperCase() + crypto.randomBytes(3).toString('hex').toUpperCase();
+      const o = { id, acc: a.id, nick: a.nick, status: 'pending', created: Date.now(), amount: CFG.passPrice };
+      if (CFG.mpToken) { const m = await mpCreate(id, a, req); Object.assign(o, { mode: 'auto', mpId: m.mpId }); passes.orders[id] = o; save('passes.json', passes); return json(res, 200, { id, mode: 'auto', code: m.code, img: m.img, amount: o.amount }); }
+      if (!CFG.pixKey) return json(res, 400, { error: 'O pagamento ainda não foi configurado pelo dono do jogo.' });
+      const code = pixPayload(id, o.amount); const img = QR ? await QR.toDataURL(code, { margin: 1, width: 320 }) : null;
+      Object.assign(o, { mode: 'manual' }); passes.orders[id] = o; save('passes.json', passes);
+      return json(res, 200, { id, mode: 'manual', code, img, amount: o.amount });
+    }
+    if (p === '/api/pass/status') {
+      const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
+      const o = passes.orders[url.searchParams.get('id') || '']; if (!o || o.acc !== a.id) return json(res, 404, { error: 'Pedido não encontrado.' });
+      if (o.mode === 'auto' && o.status !== 'approved') await mpCheck(o).catch(() => {});
+      return json(res, 200, { status: passes.orders[o.id].status });
+    }
+    if (req.method === 'POST' && p === '/api/pass/paid') {
+      const a = accountOf(tokenOf(req, url)); const b = await body(req); const o = passes.orders[b.id || ''];
+      if (!a || !o || o.acc !== a.id) return json(res, 404, { error: 'Pedido não encontrado.' });
+      if (o.status === 'pending') { o.status = 'review'; o.claimedPaid = Date.now(); save('passes.json', passes); }
+      return json(res, 200, { status: o.status });
+    }
+    if (req.method === 'POST' && p === '/api/pass/claim') {
+      const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
+      const g = passes.grants[a.id]; if (!g || !g.pending.length) return json(res, 200, { n: 0, until: g ? g.until : 0 });
+      const n = g.pending.length; g.pending = []; save('passes.json', passes); return json(res, 200, { n, until: g.until });
+    }
+    if (p === '/api/pass/webhook') {
+      let id = url.searchParams.get('data.id') || url.searchParams.get('id'); if (req.method === 'POST') { const b = await body(req).catch(() => ({})); id = id || (b.data && b.data.id); }
+      if (id && CFG.mpToken) { const o = Object.values(passes.orders).find((x) => String(x.mpId) === String(id)); if (o) await mpCheck(o).catch(() => {}); }
+      res.writeHead(200); return res.end('ok');
+    }
+    if (p === '/admin') {
+      if (!CFG.adminKey || url.searchParams.get('key') !== CFG.adminKey) { res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }); return res.end('Acesso negado. Configure ADMIN_KEY no Render e abra /admin?key=SUA_CHAVE'); }
+      const ap = url.searchParams.get('approve'); if (ap && passes.orders[ap]) grantPass(ap);
+      const rj = url.searchParams.get('reject'); if (rj && passes.orders[rj] && passes.orders[rj].status !== 'approved') { passes.orders[rj].status = 'rejected'; save('passes.json', passes); }
+      const rows = Object.values(passes.orders).sort((x, y) => y.created - x.created).slice(0, 200).map((o) => `<tr><td>${o.id}</td><td>${String(o.nick || '').replace(/[<>&]/g, '')}</td><td>R$ ${Number(o.amount).toFixed(2)}</td><td>${o.mode}</td><td><b>${o.status}</b></td><td>${new Date(o.created).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}</td><td>${o.status !== 'approved' ? `<a href="?key=${encodeURIComponent(CFG.adminKey)}&approve=${o.id}">Aprovar</a> · <a href="?key=${encodeURIComponent(CFG.adminKey)}&reject=${o.id}">Recusar</a>` : '✔'}</td></tr>`).join('');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      return res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin · Passes</title><style>body{font-family:system-ui;margin:20px;background:#f6ecd8;color:#2a1e14}table{border-collapse:collapse;width:100%;font-size:14px}td,th{border:1px solid #c8a070;padding:6px;text-align:left}th{background:#e8d4b0}</style><h1>Passes Mensais</h1><p>Pedidos "review" = o jogador disse que pagou. Confira no app do banco pelo código do pedido (aparece na descrição do Pix) e aprove.</p><table><tr><th>Pedido</th><th>Jogador</th><th>Valor</th><th>Modo</th><th>Status</th><th>Criado</th><th>Ação</th></tr>${rows}</table>`);
     }
     if (p === '/auth/config') return json(res, 200, { google: CFG.google || null, telegram: CFG.tgBot && CFG.tgToken ? CFG.tgBot : null, x: !!CFG.xId, guest: true });
     if (p === '/auth/x') return xStart(req, res);
