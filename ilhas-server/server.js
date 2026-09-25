@@ -135,7 +135,7 @@ function upsert(id, provider, name) {
   const a = accounts[id] || (accounts[id] = { id, provider, name: '', nick: '', created: Date.now() });
   a.name = String(name || a.name || '').slice(0, 40); a.seen = Date.now(); save('accounts.json', accounts); return a;
 }
-const pubAcc = (a) => { const g = passes.grants[a.id]; return { provider: a.provider, name: a.name, nick: a.nick, cls: a.cls || null, blk: a.blk || null, hasSave: fs.existsSync(fileOf(a.id)), pass: g ? { until: g.until, pending: g.pending.length } : null }; };
+const pubAcc = (a) => { const g = passes.grants[a.id]; return { provider: a.provider, name: a.name, nick: a.nick, cls: a.cls || null, blk: a.blk || null, hasSave: fs.existsSync(fileOf(a.id)), pass: g ? { until: g.until, pending: g.pending.length } : null, delUntil: a.delUntil > Date.now() ? a.delUntil : 0 }; };
 
 // ---------- utilidades HTTP ----------
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.webp': 'image/webp', '.json': 'application/json' };
@@ -345,8 +345,27 @@ const server = http.createServer(async (req, res) => {
       if (old) broadcast({ t: 'chat', ch: 'sys', text: `${old} agora se chama ${n}.` });
       return json(res, 200, { account: pubAcc(a) });
     }
+    if (p === '/api/chars') { // personagens desta conta
+      const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
+      const chars = []; if (a.nick) { const sv = readSave(a.id); const lvl = (sv && sv.ST && sv.ST.lvl) || (RANK[a.id] && RANK[a.id].lv) || 1; chars.push({ nick: a.nick, cls: a.cls || (sv && sv.player && sv.player.cls) || '', blk: a.blk || 1, lvl }); }
+      return json(res, 200, { chars, delUntil: a.delUntil > Date.now() ? a.delUntil : 0 });
+    }
+    if (req.method === 'POST' && p === '/api/char/delete') { // excluir personagem: bloqueia criar outro por 30 min
+      const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
+      const b = await body(req); if (!a.nick) return json(res, 404, { error: 'Esta conta não tem personagem.' });
+      if (String(b.nick || '').trim().toLowerCase() !== a.nick.toLowerCase()) return json(res, 400, { error: 'Digite o nick exatamente para confirmar.' });
+      const old = a.nick; try { fs.unlinkSync(fileOf(a.id)); } catch (e) {}
+      a.nick = null; a.cls = null; a.blk = null; a.delUntil = Date.now() + CHAR_DEL_LOCK;
+      if (RANK[a.id]) { delete RANK[a.id]; save('ranking.json', RANK); }
+      for (const k in CHAMPS) if (CHAMPS[k][a.id]) { delete CHAMPS[k][a.id]; save('champs.json', CHAMPS); }
+      save('accounts.json', accounts);
+      for (const [ws2, c] of clients) if (c.pid === a.id) { try { send(ws2, { t: 'char_deleted' }); ws2.close(); } catch (e) {} }
+      console.log('personagem excluído:', old);
+      return json(res, 200, { ok: true, account: pubAcc(a) });
+    }
     if (req.method === 'POST' && p === '/api/nick') {
       const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
+      if (!a.nick && a.delUntil > Date.now()) { const mn = Math.ceil((a.delUntil - Date.now()) / 60000); return json(res, 429, { error: `Você excluiu um personagem. Poderá criar outro em ${mn} min.` }); }
       const b = await body(req); const n = cleanNick(b.nick); if (!nickOk(n)) return json(res, 400, { error: 'Nick inválido.' });
       const taken = Object.values(accounts).some((o) => o.id !== a.id && o.nick && o.nick.toLowerCase() === n.toLowerCase());
       if (taken) return json(res, 409, { error: 'Esse nick já está em uso. Escolha outro.' });
@@ -399,6 +418,7 @@ const dayKey = () => new Date(Date.now() - 3 * 3600e3).toISOString().slice(0, 10
 const roomOf = (p) => p.room || (p.b + ':' + p.m);
 // ---------- Monstros compartilhados do mapa aberto (por bloco + mapa) ----------
 const MW = new Map(); // roomKey -> {h:{hkey:{gen,n,killed:Set,respawnAt}}, dead:Set, dmg:{}, own:{}, boss:{bidx:{gen,deadUntil}}}
+const CHAR_DEL_LOCK = +process.env.CHAR_DEL_LOCK_MS || 30 * 60 * 1000;
 const HORDE_RESPAWN = +process.env.HORDE_RESPAWN_MS || 60 * 1000, WBOSS_RESPAWN = +process.env.WBOSS_RESPAWN_MS || 3600 * 1000;
 function mwOf(k) { let w = MW.get(k); if (!w) { w = { h: {}, dead: new Set(), dmg: {}, mhp: {}, own: {}, boss: {} }; MW.set(k, w); } return w; }
 function mwRoomSend(k, msg, except) { const s = JSON.stringify(msg); for (const [ws, p] of clients) if (p.ready && p !== except && ws.readyState === 1 && !p.room && (p.b + ':' + p.m) === k) ws.send(s); }
