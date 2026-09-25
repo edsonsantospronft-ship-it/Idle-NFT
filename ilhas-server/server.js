@@ -42,6 +42,8 @@ const FEE = 0.05;
 const castle = load('castle.json', { guild: null, champ: null, champPid: null, since: 0, tre: { gold: 0, ruby: 0, cristal: 0 }, buffs: [], titles: [], chestWeek: {}, crbuy: {} });
 const week = () => Math.floor((Date.now() / 864e5 + 3) / 7);
 const spidOf = (pid) => crypto.createHash('sha1').update(String(pid)).digest('hex').slice(0, 12);
+const CHAMPS = load('champs.json', {});
+const pubChamps = () => { const o = {}; for (const k in CHAMPS) o[k] = Object.values(CHAMPS[k]).sort((a, b) => b.n - a.n || b.last - a.last).slice(0, 3).map(({ nick, cls, gtag, n }) => ({ nick, cls, gtag, n })); return o; };
 const pubCastle = () => ({ guild: castle.guild, champ: castle.champ, champSpid: castle.champPid ? spidOf(castle.champPid) : '', since: castle.since, tre: castle.tre, buffs: castle.buffs, titles: castle.titles.map(({ pid, ...t }) => t) });
 const crLeft = (pid) => { const r = castle.crbuy[pid]; return 50 - (r && r.w === week() ? r.n : 0); };
 const CR_PRICE = 1000, CR_WEEK = 50;
@@ -287,6 +289,20 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, taken ? { ok: false, msg: 'Esse nick já está em uso.' } : { ok: true, msg: 'Nick disponível!' });
     }
     if (p === '/api/blocks') { const c = { 1: 0, 2: 0, 3: 0, 4: 0 }; for (const [, q] of clients) if (q.ready) c[q.b] = (c[q.b] || 0) + 1; return json(res, 200, { c }); }
+    if (req.method === 'POST' && p === '/api/rename') {
+      const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
+      const b = await body(req); const n = cleanNick(b.nick); if (!nickOk(n)) return json(res, 400, { error: 'Nick inválido: use de 3 a 16 letras, números, espaço, ponto, traço ou _.' });
+      if (a.nick && a.nick.toLowerCase() === n.toLowerCase() && a.nick === n) return json(res, 400, { error: 'Esse já é o seu nome.' });
+      const taken = Object.values(accounts).some((o) => o.id !== a.id && o.nick && o.nick.toLowerCase() === n.toLowerCase());
+      if (taken) return json(res, 409, { error: 'Esse nick já está em uso. Escolha outro.' });
+      const old = a.nick; a.nick = n; save('accounts.json', accounts);
+      for (const [, c] of clients) if (c.pid === a.id) c.nick = n;
+      if (RANK[a.id]) { RANK[a.id].nick = n; save('ranking.json', RANK); }
+      for (const k in CHAMPS) if (CHAMPS[k][a.id]) { CHAMPS[k][a.id].nick = n; save('champs.json', CHAMPS); }
+      if (castle.champPid === a.id) { castle.champ = n; save('castle.json', castle); }
+      if (old) broadcast({ t: 'chat', ch: 'sys', text: `${old} agora se chama ${n}.` });
+      return json(res, 200, { account: pubAcc(a) });
+    }
     if (req.method === 'POST' && p === '/api/nick') {
       const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
       const b = await body(req); const n = cleanNick(b.nick); if (!nickOk(n)) return json(res, 400, { error: 'Nick inválido.' });
@@ -321,6 +337,51 @@ const clean = (s, n) => String(s == null ? '' : s).replace(/[<>]/g, '').slice(0,
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
 function send(ws, msg) { if (ws.readyState === 1) ws.send(JSON.stringify(msg)); }
 function broadcast(msg, filter) { const s = JSON.stringify(msg); for (const [ws, p] of clients) if (ws.readyState === 1 && (!filter || filter(p))) ws.send(s); }
+function bySpid(spid) { for (const [ws, p] of clients) if (p.spid === spid && p.ready) return ws; return null; }
+const PARTIES = new Map(); let PARTY_SEQ = 0;
+const { createMatch } = require('./arena');
+const ARENA_TEAM = Math.max(1, Math.min(5, parseInt(process.env.ARENA_TEAM || '5', 10) || 5));
+const QUEUE = [], MATCHES = new Map(); let MATCH_SEQ = 0;
+const arenaDay = load('arena_day.json', {});
+// ---------- Rankings ----------
+const RANK = load('ranking.json', {});
+const RK_CATS = ['arK', 'arT', 'wK', 'eK', 'pw', 'sk', 'lv'];
+function rkRec(p) { if (!p || !p.pid) return null; const r = RANK[p.pid] || (RANK[p.pid] = { nick: p.nick, cls: p.cls || '' }); r.nick = p.nick; if (p.cls) r.cls = p.cls; return r; }
+function rkAdd(p, k, n) { const r = rkRec(p); if (!r) return; r[k] = (r[k] || 0) + n; save('ranking.json', RANK); }
+function rkSet(p, k, v) { const r = rkRec(p); if (!r) return; if (r[k] !== v) { r[k] = v; save('ranking.json', RANK); } }
+function rkTop(cat, me) { const list = Object.entries(RANK).filter(([, r]) => (r[cat] || 0) > 0).map(([pid, r]) => ({ pid, nick: r.nick, cls: r.cls || '', v: r[cat] || 0 })).sort((a, b) => b.v - a.v);
+  const i = me ? list.findIndex((x) => x.pid === me.pid) : -1; return { top: list.slice(0, 50).map(({ nick, cls, v }) => ({ nick, cls, v })), me: i >= 0 ? { rank: i + 1, v: list[i].v } : null, total: list.length }; }
+const dayKey = () => new Date(Date.now() - 3 * 3600e3).toISOString().slice(0, 10);
+const roomOf = (p) => p.room || (p.b + ':' + p.m);
+function arenaDetach(p) { p.match = null; p.team = null; p.room = null; }
+function startMatch(ptA, ptB) {
+  const id = ++MATCH_SEQ; const teams = [ptA, ptB].map((pt) => pt.mem.map((s) => { const w = bySpid(s); return w && clients.get(w); }).filter(Boolean));
+  const today = dayKey();
+  const A = createMatch(id, teams, { stat: (spid, k, n) => { const w = bySpid(spid); const p = w && clients.get(w); if (p) rkAdd(p, k, n); }, send: (spid, msg) => { const w = bySpid(spid); if (w) send(w, msg); }, ended: (M) => { setTimeout(() => finishMatch(M), 50); } });
+  A.parties = [ptA, ptB]; MATCHES.set(id, A);
+  const roster = []; teams.forEach((tm, i) => tm.forEach((p) => roster.push({ spid: p.spid, nick: p.nick, cls: p.cls || '', lvl: p.lvl, team: i })));
+  teams.forEach((tm, i) => tm.forEach((p) => { p.match = id; p.team = i; p.room = 'A' + id; arenaDay[p.pid] = today; send(bySpid(p.spid), { t: 'ar_start', id, team: i, roster }); }));
+  save('arena_day.json', arenaDay);
+  for (const pt of [ptA, ptB]) { pt.st = 'match'; if (pt.ready) pt.ready.clear(); partyPush(pt, null); }
+}
+function finishMatch(A) { if (!MATCHES.has(A.id)) return; MATCHES.delete(A.id);
+  for (const pl of A.pl.values()) { const w = bySpid(pl.spid); const p = w && clients.get(w); if (p && p.match === A.id) arenaDetach(p); }
+  for (const pt of A.parties) { if (!PARTIES.has(pt.id)) continue; pt.st = 'idle'; if (pt.ready) pt.ready.clear(); partyPush(pt, null); } }
+setInterval(() => {
+  for (let i = QUEUE.length - 1; i >= 0; i--) { const pt = PARTIES.get(QUEUE[i]); if (!pt || pt.st !== 'queue' || pt.mem.length < ARENA_TEAM || !pt.mem.every((s) => bySpid(s))) { QUEUE.splice(i, 1); if (pt) { partyUnready(pt); partyPush(pt, 'A busca por partida foi cancelada.'); } } }
+  while (QUEUE.length >= 2) { const a = PARTIES.get(QUEUE.shift()), b = PARTIES.get(QUEUE.shift()); startMatch(a, b); }
+}, 1000);
+setInterval(() => { for (const A of MATCHES.values()) { A.tick(0.1); if (!A.over) { const st = JSON.stringify(A.state()); for (const pl of A.pl.values()) if (!pl.gone) { const w = bySpid(pl.spid); if (w && w.readyState === 1) w.send(st); } } } }, 100);
+function partyState(pt) { return { t: 'pt', id: pt.id, leader: pt.leader, need: ARENA_TEAM, st: pt.st || 'idle', ready: [...(pt.ready || [])], mem: pt.mem.map((s) => { const w = bySpid(s); const p = w && clients.get(w); return p ? { spid: s, nick: p.nick, lvl: p.lvl, cls: p.cls || '', hp: p.hp == null ? 1 : p.hp, b: p.b, m: p.m, on: 1 } : { spid: s, on: 0 }; }) }; }
+function partyPush(pt, msg) { const st = partyState(pt); for (const s of pt.mem) { const w = bySpid(s); if (w) { send(w, st); if (msg) send(w, { t: 'pt_msg', msg }); } } }
+function partyUnready(pt) { if (!pt) return; if (pt.ready) pt.ready.clear(); if (pt.st === 'queue') pt.st = 'idle'; const i = QUEUE.indexOf(pt.id); if (i >= 0) QUEUE.splice(i, 1); }
+function partyLeave(p) {
+  const pt = PARTIES.get(p.party); p.party = null; if (!pt) return; partyUnready(pt);
+  pt.mem = pt.mem.filter((s) => s !== p.spid); const w = bySpid(p.spid); if (w) send(w, { t: 'pt', id: null, leader: null, mem: [] });
+  if (pt.mem.length <= 1) { for (const s of pt.mem) { const w2 = bySpid(s); if (w2) { clients.get(w2).party = null; send(w2, { t: 'pt', id: null, leader: null, mem: [] }); send(w2, { t: 'pt_msg', msg: 'A equipe foi desfeita.' }); } } PARTIES.delete(pt.id); return; }
+  if (pt.leader === p.spid) pt.leader = pt.mem[0];
+  partyPush(pt, `${p.nick} saiu da equipe.`);
+}
 function byPid(pid) { for (const [ws, p] of clients) if (p.pid === pid) return ws; return null; }
 const publicMarket = () => market.list.map(({ pid, ...l }) => Object.assign(l, { spid: crypto.createHash('sha1').update(String(pid)).digest('hex').slice(0, 12) }));
 
@@ -339,6 +400,7 @@ wss.on('connection', (ws) => {
         me.lvl = num(d.lvl, 1); me.ready = true;
         const pr = proceeds[me.pid]; if (pr) { delete proceeds[me.pid]; save('proceeds.json', proceeds); }
         send(ws, { t: 'welcome', pid: me.spid, market: publicMarket(), proceeds: pr || null });
+        send(ws, { t: 'champs', c: pubChamps() });
         send(ws, { t: 'castle', c: pubCastle(), crLeft: crLeft(me.pid), chestOk: castle.champPid === me.pid && castle.chestWeek[me.pid] !== week() });
         broadcast({ t: 'chat', ch: 'sys', text: `${me.nick} entrou no mundo.` }, (p) => p !== me);
         break;
@@ -346,7 +408,9 @@ wss.on('connection', (ws) => {
       case 'pos':
         me.b = Math.max(1, Math.min(4, num(d.b, 1) | 0)); me.m = num(d.m, 0) | 0;
         me.x = num(d.x); me.y = num(d.y); me.dir = clean(d.dir, 1) || 'd'; me.mv = d.mv ? 1 : 0;
-        me.mount = clean(d.mount, 16); me.lvl = num(d.lvl, me.lvl); me.wp = clean(d.wp, 16); me.sw = d.sw ? 1 : 0; me.dn = d.dn ? 1 : 0; me.sk = clean(d.sk, 24);
+        me.mount = clean(d.mount, 16); me.lvl = num(d.lvl, me.lvl); me.wp = clean(d.wp, 16); me.sw = d.sw ? 1 : 0; me.dn = d.dn ? 1 : 0; me.sk = clean(d.sk, 24); me.cls = clean(d.cls, 16); me.hp = Math.max(0, Math.min(1, num(d.hp, 1))); me.pd = Math.max(1, Math.min(1e6, num(d.pd, 8)));
+        if (d.pw != null && (!me.rkT || Date.now() - me.rkT > 10000)) { me.rkT = Date.now(); rkSet(me, 'pw', Math.max(0, Math.min(1e9, Math.floor(num(d.pw))))); rkSet(me, 'sk', Math.max(0, Math.min(1000, Math.floor(num(d.sc))))); rkSet(me, 'lv', Math.max(1, Math.min(9999, Math.floor(me.lvl || 1)))); }
+        if (d.ti !== undefined) me.ti = clean(d.ti, 40);
         if (d.guild !== undefined) me.guild = d.guild ? { name: clean(d.guild.name, 20), tag: clean(d.guild.tag, 4) } : null;
         break;
       case 'chat': {
@@ -356,14 +420,88 @@ wss.on('connection', (ws) => {
         broadcast({ t: 'chat', ch, from: me.nick, gtag: me.guild ? me.guild.tag : '', b: me.b, text }, ch === 'local' ? (p) => p.b === me.b && p.m === me.m : null);
         break;
       }
+      // ---------- Equipe (grupo de até 5) ----------
+      case 'pt_who': {
+        const list = [];
+        for (const [, p2] of clients) if (p2.ready && p2 !== me) list.push({ spid: p2.spid, nick: p2.nick, lvl: p2.lvl, cls: p2.cls || '', b: p2.b, m: p2.m, x: Math.round(p2.x), y: Math.round(p2.y), gtag: p2.guild ? p2.guild.tag : '', inParty: !!p2.party });
+        send(ws, { t: 'pt_who', list: list.slice(0, 200) });
+        break;
+      }
+      case 'pt_inv': {
+        const ws2 = bySpid(d.to); if (!ws2) { send(ws, { t: 'pt_msg', msg: 'Esse jogador não está online.' }); break; }
+        const p2 = clients.get(ws2); if (p2.party) { send(ws, { t: 'pt_msg', msg: `${p2.nick} já está em uma equipe.` }); break; }
+        const pt = me.party && PARTIES.get(me.party); if (pt && pt.mem.length >= 5) { send(ws, { t: 'pt_msg', msg: 'Sua equipe já tem 5 jogadores.' }); break; }
+        if (pt && pt.st && pt.st !== 'idle') { send(ws, { t: 'pt_msg', msg: 'Sua equipe já está buscando partida.' }); break; }
+        (p2.invites || (p2.invites = {}))[me.spid] = Date.now();
+        send(ws2, { t: 'pt_invite', from: me.nick, fspid: me.spid, lvl: me.lvl, cls: me.cls || '' });
+        send(ws, { t: 'pt_msg', msg: `Convite enviado para ${p2.nick}.` });
+        break;
+      }
+      case 'pt_acc': {
+        const t0 = me.invites && me.invites[d.from]; if (!t0 || Date.now() - t0 > 120000) { send(ws, { t: 'pt_msg', msg: 'O convite expirou.' }); break; }
+        delete me.invites[d.from]; if (me.party) partyLeave(me);
+        const ws2 = bySpid(d.from); if (!ws2) { send(ws, { t: 'pt_msg', msg: 'Quem convidou saiu do jogo.' }); break; }
+        const p2 = clients.get(ws2); let pt = p2.party && PARTIES.get(p2.party);
+        if (!pt) { pt = { id: 'P' + (++PARTY_SEQ), leader: p2.spid, mem: [p2.spid] }; PARTIES.set(pt.id, pt); p2.party = pt.id; }
+        if (pt.mem.length >= 5) { send(ws, { t: 'pt_msg', msg: 'A equipe já está cheia.' }); break; }
+        if (pt.st && pt.st !== 'idle') { send(ws, { t: 'pt_msg', msg: 'Essa equipe já está buscando partida ou jogando.' }); break; }
+        pt.mem.push(me.spid); me.party = pt.id; partyPush(pt, `${me.nick} entrou na equipe.`);
+        break;
+      }
+      case 'pt_dec': { if (me.invites) delete me.invites[d.from]; const ws2 = bySpid(d.from); if (ws2) send(ws2, { t: 'pt_msg', msg: `${me.nick} recusou o convite.` }); break; }
+      case 'pt_leave': { const pt = me.party && PARTIES.get(me.party); if (pt && (pt.st === 'match' || me.match)) { send(ws, { t: 'pt_msg', msg: 'Só é possível sair da equipe antes da partida começar, ainda no mapa normal.' }); break; } if (me.party) partyLeave(me); break; }
+      case 'pt_kick': {
+        const pt = me.party && PARTIES.get(me.party); if (!pt || pt.leader !== me.spid) break;
+        if (pt.st === 'match') { send(ws, { t: 'pt_msg', msg: 'Não dá para remover alguém durante a partida.' }); break; }
+        const ws2 = bySpid(d.to); if (ws2 && clients.get(ws2).party === pt.id) { send(ws2, { t: 'pt_msg', msg: 'Você foi removido da equipe.' }); partyLeave(clients.get(ws2)); }
+        break;
+      }
+      case 'rk_me': { send(ws, { t: 'rk_me', r: RANK[me.pid] || {} }); break; }
+      case 'pm': {
+        const now = Date.now(); if (now - (me.lastChat || 0) < 700) return; me.lastChat = now;
+        const text = clean(d.text, 140).trim(); if (!text) return; const w2 = bySpid(d.to); if (!w2) { send(ws, { t: 'chat', ch: 'sys', text: 'Esse jogador não está online.' }); break; }
+        const p2 = clients.get(w2); const msg = { t: 'chat', ch: 'pm', from: me.nick, fspid: me.spid, to: p2.nick, tspid: p2.spid, gtag: me.guild ? me.guild.tag : '', text };
+        send(w2, msg); send(ws, msg); break;
+      }
+      case 'insp': {
+        const w2 = bySpid(d.to); if (!w2) { send(ws, { t: 'insp_err', msg: 'Esse jogador não está online.' }); break; }
+        send(w2, { t: 'insp_req', from: me.spid }); break;
+      }
+      case 'insp_res': {
+        const w2 = bySpid(d.to); if (!w2 || !d.p || typeof d.p !== 'object') break;
+        const pr = d.p; if (typeof pr.av === 'string' && pr.av.length > 30000) pr.av = '';
+        const ranks = {}; for (const c of RK_CATS) { const t = rkTop(c, me); ranks[c] = t.me ? t.me.rank : null; }
+        send(w2, { t: 'insp', spid: me.spid, p: pr, ranks }); break;
+      }
+      case 'rk': { const cat = RK_CATS.includes(d.cat) ? d.cat : 'pw'; send(ws, Object.assign({ t: 'rk', cat }, rkTop(cat, me))); break; }
+      case 'pt_ready': {
+        const pt = me.party && PARTIES.get(me.party); if (!pt) { send(ws, { t: 'pt_msg', msg: 'Monte uma equipe de 5 jogadores primeiro.' }); break; }
+        if (pt.st === 'match' || me.match) break;
+        pt.ready = pt.ready || new Set();
+        if (!d.on) { const was = pt.st === 'queue'; pt.ready.delete(me.spid); if (was) { pt.st = 'idle'; const i = QUEUE.indexOf(pt.id); if (i >= 0) QUEUE.splice(i, 1); } partyPush(pt, was ? `${me.nick} cancelou: a busca por partida parou.` : null); break; }
+        if (pt.mem.length < ARENA_TEAM) { send(ws, { t: 'pt_msg', msg: `A equipe precisa de ${ARENA_TEAM} jogadores para iniciar.` }); break; }
+        if (!pt.mem.every((s2) => bySpid(s2))) { send(ws, { t: 'pt_msg', msg: 'Todos da equipe precisam estar online.' }); break; }
+        if (me.m === 14 || me.m === 4 || me.m === 5 || me.m >= 11) { send(ws, { t: 'pt_msg', msg: 'Volte para uma ilha (mapa normal) antes de iniciar.' }); break; }
+        if (arenaDay[me.pid] === dayKey()) { send(ws, { t: 'pt_msg', msg: 'Você já entrou na arena hoje. Volte amanhã!' }); break; }
+        if (!d.tk) { send(ws, { t: 'pt_msg', msg: 'Você precisa de um Ticket da Arena (1.000 ouro).' }); break; }
+        pt.ready.add(me.spid);
+        if (pt.mem.every((s2) => pt.ready.has(s2))) { pt.st = 'queue'; if (!QUEUE.includes(pt.id)) QUEUE.push(pt.id); partyPush(pt, 'Todos prontos! Buscando equipe adversária…'); }
+        else partyPush(pt, `${me.nick} está pronto (${pt.ready.size}/${pt.mem.length}).`);
+        break;
+      }
+      case 'ar_hit': { const A = me.match && MATCHES.get(me.match); if (A) { if (Array.isArray(d.l)) for (const h of d.l.slice(0, 30)) A.hit(me.spid, num(h[0]) | 0, num(h[1])); else A.hit(me.spid, num(d.id) | 0, num(d.d)); } break; }
+      case 'ar_dead': { const A = me.match && MATCHES.get(me.match); if (A) A.dead(me.spid, clean(d.by, 24)); break; }
+      case 'ar_met': { const A = me.match && MATCHES.get(me.match); if (A) A.meteor(me.spid, num(d.x), num(d.y)); break; }
+      case 'ar_quit': { const A = me.match && MATCHES.get(me.match); if (A) { A.leave(me.spid); } arenaDetach(me); break; }
       case 'revive': case 'pull': {
-        for (const [ws2, p2] of clients) if (p2.spid === d.to && p2.b === me.b && p2.m === me.m) send(ws2, d.t === 'revive' ? { t: 'revived', from: me.nick } : { t: 'pulled', from: me.nick, x: num(d.x), y: num(d.y) });
+        for (const [ws2, p2] of clients) if (p2.spid === d.to && roomOf(p2) === roomOf(me) && (!me.match || (d.t === 'revive' ? p2.team === me.team : p2.team !== me.team))) send(ws2, d.t === 'revive' ? { t: 'revived', from: me.nick } : { t: 'pulled', from: me.nick, x: num(d.x), y: num(d.y) });
         break;
       }
       case 'pvp': case 'pvp_ko': {
         const dmg = Math.max(1, Math.min(99999, Math.floor(num(d.dmg, 1))));
-        for (const [ws2, p2] of clients) if (p2.spid === d.to && p2.b === me.b && p2.m === me.m) {
+        for (const [ws2, p2] of clients) if (p2.spid === d.to && roomOf(p2) === roomOf(me) && (!me.match || p2.team !== me.team)) {
           send(ws2, d.t === 'pvp' ? { t: 'pvp_hit', from: me.nick, fspid: me.spid, dmg } : { t: 'pvp_ko', from: me.nick });
+          if (d.t === 'pvp_ko' && !me.match && !p2.match) { const now = Date.now(); if (!me.koT || now - me.koT > 3000) { me.koT = now; const acc = accounts[p2.pid]; const home = acc && acc.blk ? acc.blk : 1; rkAdd(p2, p2.b !== home ? 'eK' : 'wK', 1); } }
         }
         break;
       }
@@ -384,6 +522,7 @@ wss.on('connection', (ws) => {
             s.winner = { nick: me.nick, guild: me.guild }; s.resetAt = Date.now() + SG_RESET;
             castle.guild = me.guild; castle.champ = me.nick; castle.champPid = me.pid; castle.since = Date.now(); castle.buffs = []; castle.titles = [];
             save('castle.json', castle); broadcast({ t: 'castle', c: pubCastle() });
+            { const isl = Math.max(0, Math.min(10, num(d.isl, 0) | 0)); const L = CHAMPS[isl] || (CHAMPS[isl] = {}); const r0 = L[me.pid] || (L[me.pid] = { n: 0 }); Object.assign(r0, { nick: me.nick, cls: me.cls || '', gtag: me.guild ? me.guild.tag : '', n: r0.n + 1, last: Date.now() }); save('champs.json', CHAMPS); broadcast({ t: 'champs', c: pubChamps() }); }
             broadcast({ t: 'chat', ch: 'sys', text: `${me.nick} quebrou o Cristal do Cerco! A guilda ${me.guild.name} [${me.guild.tag}] conquistou o castelo.` });
             send(ws, { t: 'castle', c: pubCastle(), chestOk: castle.chestWeek[me.pid] !== week() });
           }
@@ -495,19 +634,22 @@ wss.on('connection', (ws) => {
       }
     }
   });
-  ws.on('close', () => { clients.delete(ws); if (me.ready) broadcast({ t: 'chat', ch: 'sys', text: `${me.nick} saiu do mundo.` }); });
+  ws.on('close', () => { me.gone = true; if (me.match) { const A = MATCHES.get(me.match); if (A) A.leave(me.spid); } if (me.party) { const pt0 = PARTIES.get(me.party); if (pt0 && pt0.st !== 'match') partyUnready(pt0); }
+  if (me.party) { const pid0 = me.party; clients.delete(ws); const pt = PARTIES.get(pid0); if (pt) { me.party = pid0; const keep = me.spid; pt.mem = pt.mem.filter((x) => x !== keep); me.party = null; if (pt.mem.length <= 1) { for (const s2 of pt.mem) { const w2 = bySpid(s2); if (w2) { clients.get(w2).party = null; send(w2, { t: 'pt', id: null, leader: null, mem: [] }); send(w2, { t: 'pt_msg', msg: 'A equipe foi desfeita.' }); } } PARTIES.delete(pt.id); } else { if (pt.leader === keep) pt.leader = pt.mem[0]; partyPush(pt, `${me.nick} saiu do jogo.`); } } }
+  clients.delete(ws); if (me.ready) broadcast({ t: 'chat', ch: 'sys', text: `${me.nick} saiu do mundo.` }); });
 });
 
 setInterval(() => {
   const rooms = new Map();
-  for (const [, p] of clients) { if (!p.ready) continue; const k = p.b + ':' + p.m; (rooms.get(k) || rooms.set(k, []).get(k)).push(p); }
+  for (const [, p] of clients) { if (!p.ready) continue; const k = roomOf(p); (rooms.get(k) || rooms.set(k, []).get(k)).push(p); }
   for (const [ws, p] of clients) {
     if (!p.ready || ws.readyState !== 1) continue;
-    const list = (rooms.get(p.b + ':' + p.m) || []).filter((o) => o !== p)
-      .map((o) => [o.spid, o.nick, Math.round(o.x), Math.round(o.y), o.dir, o.mv, o.lvl, o.guild ? o.guild.tag : '', o.guild ? o.guild.name : '', o.mount, o.wp || '', o.sw || 0, o.dn || 0, o.sk || '']);
+    const list = (rooms.get(roomOf(p)) || []).filter((o) => o !== p)
+      .map((o) => [o.spid, o.nick, Math.round(o.x), Math.round(o.y), o.dir, o.mv, o.lvl, o.guild ? o.guild.tag : '', o.guild ? o.guild.name : '', o.mount, o.wp || '', o.sw || 0, o.dn || 0, o.sk || '', o.match ? o.team : -1, o.match ? Math.round((o.hp == null ? 1 : o.hp) * 100) : -1, o.cls || '', o.ti || '']);
     ws.send(JSON.stringify({ t: 'ps', p: list }));
   }
 }, 100);
+setInterval(() => { for (const pt of PARTIES.values()) partyPush(pt); }, 2000);
 setInterval(() => {
   const c = { 1: 0, 2: 0, 3: 0, 4: 0 }; let total = 0;
   for (const [, p] of clients) if (p.ready) { c[p.b] = (c[p.b] || 0) + 1; total++; }
