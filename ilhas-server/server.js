@@ -204,7 +204,10 @@ async function xCallback(req, res, url) {
 setInterval(() => { const now = Date.now(); for (const [k, v] of xStates) if (now - v.t > 600000) xStates.delete(k); }, 60000);
 
 // ---------- HTTP ----------
+// Se REDIRECT_TO estiver configurado (ex.: no Render antigo), manda todo mundo para o endereço novo.
+const REDIRECT_TO = (process.env.REDIRECT_TO || '').replace(/\/$/, '');
 const server = http.createServer(async (req, res) => {
+  if (REDIRECT_TO && !(req.url || '').startsWith('/api/pass/webhook') && !(req.url || '').startsWith('/api/shop/webhook')) { res.writeHead(301, { location: REDIRECT_TO + (req.url || '/'), 'cache-control': 'no-store' }); return res.end(); }
   const url = new URL(req.url || '/', 'http://x');
   const p = decodeURIComponent(url.pathname);
   try {
@@ -394,6 +397,17 @@ function rkTop(cat, me) { const list = Object.entries(RANK).filter(([, r]) => (r
   const i = me ? list.findIndex((x) => x.pid === me.pid) : -1; return { top: list.slice(0, 50).map(({ nick, cls, v }) => ({ nick, cls, v })), me: i >= 0 ? { rank: i + 1, v: list[i].v } : null, total: list.length }; }
 const dayKey = () => new Date(Date.now() - 3 * 3600e3).toISOString().slice(0, 10);
 const roomOf = (p) => p.room || (p.b + ':' + p.m);
+// ---------- Monstros compartilhados do mapa aberto (por bloco + mapa) ----------
+const MW = new Map(); // roomKey -> {h:{hkey:{gen,n,killed:Set,respawnAt}}, dead:Set, dmg:{}, own:{}, boss:{bidx:{gen,deadUntil}}}
+const HORDE_RESPAWN = +process.env.HORDE_RESPAWN_MS || 60 * 1000, WBOSS_RESPAWN = +process.env.WBOSS_RESPAWN_MS || 3600 * 1000;
+function mwOf(k) { let w = MW.get(k); if (!w) { w = { h: {}, dead: new Set(), dmg: {}, mhp: {}, own: {}, boss: {} }; MW.set(k, w); } return w; }
+function mwRoomSend(k, msg, except) { const s = JSON.stringify(msg); for (const [ws, p] of clients) if (p.ready && p !== except && ws.readyState === 1 && !p.room && (p.b + ':' + p.m) === k) ws.send(s); }
+function mwState(k) { const w = mwOf(k); const h = {}, hp = {}, bd = {}; for (const hk in w.h) h[hk] = w.h[hk].gen; for (const sid in w.dmg) if (!w.dead.has(sid) && w.mhp[sid]) hp[sid] = Math.max(1, Math.round(w.mhp[sid] - w.dmg[sid])); for (const b in w.boss) bd[b] = { gen: w.boss[b].gen, dead: w.boss[b].deadUntil > Date.now() }; return { t: 'mst', h, dead: [...w.dead], hp, own: w.own, bd }; }
+function mwReleaseAll(p, k) { if (!k) return; const w = MW.get(k); if (!w) return; for (const sid in w.own) if (w.own[sid] === p.spid) { delete w.own[sid]; mwRoomSend(k, { t: 'mo', sid, o: null }, p); } }
+setInterval(() => { const now = Date.now(); for (const [k, w] of MW) { for (const hk in w.h) { const H = w.h[hk]; if (H.respawnAt && now >= H.respawnAt) { const og = H.gen; H.gen++; H.respawnAt = 0; H.killed = new Set();
+      for (const sid of [...w.dead]) if (sid.startsWith(hk + '.' + og + '.')) w.dead.delete(sid); for (const sid in w.dmg) if (sid.startsWith(hk + '.')) { delete w.dmg[sid]; delete w.own[sid]; delete w.mhp[sid]; }
+      mwRoomSend(k, { t: 'hr', hkey: hk, gen: H.gen }); } }
+    for (const b in w.boss) { const B = w.boss[b]; if (B.deadUntil && now >= B.deadUntil) { B.deadUntil = 0; B.gen++; w.dead.delete('B' + b); delete w.dmg['B' + b]; delete w.own['B' + b]; mwRoomSend(k, { t: 'br', bidx: +b, gen: B.gen }); } } } }, 1000);
 function arenaDetach(p) { p.match = null; p.team = null; p.room = null; }
 function startMatch(ptA, ptB) {
   const id = ++MATCH_SEQ; const teams = [ptA, ptB].map((pt) => pt.mem.map((s) => { const w = bySpid(s); return w && clients.get(w); }).filter(Boolean));
@@ -427,6 +441,7 @@ function byPid(pid) { for (const [ws, p] of clients) if (p.pid === pid) return w
 const publicMarket = () => market.list.map(({ pid, ...l }) => Object.assign(l, { spid: crypto.createHash('sha1').update(String(pid)).digest('hex').slice(0, 12) }));
 
 wss.on('connection', (ws) => {
+  if (REDIRECT_TO) { try { ws.send(JSON.stringify({ t: 'chat', ch: 'sys', text: 'O jogo mudou de endereço: ' + REDIRECT_TO })); } catch (e) {} ws.close(); return; }
   const me = { pid: null, spid: '', nick: '?', guild: null, lvl: 1, b: 1, m: 0, x: 0, y: 0, dir: 'd', mv: 0, mount: '', lastChat: 0, ready: false };
   clients.set(ws, me);
   ws.on('message', (raw) => {
@@ -455,6 +470,7 @@ wss.on('connection', (ws) => {
               if (best) { me.b = best; me.hadPos = true; send(ws, { t: 'blk_full', b: nb, to: best, cap: BLK_CAP }); break; } }
             me.b = nb; me.hadPos = true; } }
         me.m = num(d.m, 0) | 0;
+        { const nk = me.room ? null : me.b + ':' + me.m; if (nk !== me.mwKey) { mwReleaseAll(me, me.mwKey); me.mwKey = nk; if (nk) send(ws, Object.assign(mwState(nk), { b: me.b, m: me.m })); } }
         me.x = num(d.x); me.y = num(d.y); me.dir = clean(d.dir, 1) || 'd'; me.mv = d.mv ? 1 : 0;
         me.mount = clean(d.mount, 16); me.lvl = num(d.lvl, me.lvl); me.wp = clean(d.wp, 16); me.sw = d.sw ? 1 : 0; me.dn = d.dn ? 1 : 0; me.sk = clean(d.sk, 24); me.cls = clean(d.cls, 16); me.hp = Math.max(0, Math.min(1, num(d.hp, 1))); me.pd = Math.max(1, Math.min(1e6, num(d.pd, 8)));
         if (d.pw != null && (!me.rkT || Date.now() - me.rkT > 10000)) { me.rkT = Date.now(); rkSet(me, 'pw', Math.max(0, Math.min(1e9, Math.floor(num(d.pw))))); rkSet(me, 'sk', Math.max(0, Math.min(1000, Math.floor(num(d.sc))))); rkSet(me, 'lv', Math.max(1, Math.min(9999, Math.floor(me.lvl || 1)))); }
@@ -504,6 +520,20 @@ wss.on('connection', (ws) => {
         const ws2 = bySpid(d.to); if (ws2 && clients.get(ws2).party === pt.id) { send(ws2, { t: 'pt_msg', msg: 'Você foi removido da equipe.' }); partyLeave(clients.get(ws2)); }
         break;
       }
+      case 'mh': { // golpes em monstros: l = [[sid, dmg, mhp, hkey, n]]
+        const k = me.mwKey; if (!k || !Array.isArray(d.l)) break; const w = mwOf(k); const now = Date.now(); if (now - (me.mhT || 0) > 1000) { me.mhT = now; me.mhN = 0; }
+        for (const it of d.l.slice(0, 40)) { if (++me.mhN > 80) break; const sid = clean(it[0], 40); if (!sid || w.dead.has(sid)) continue; const dmg = Math.max(0, Math.min(1e7, num(it[1]))); const mhp = Math.max(1, Math.min(1e9, num(it[2], 1)));
+          if (!w.mhp[sid]) w.mhp[sid] = mhp; w.dmg[sid] = (w.dmg[sid] || 0) + dmg; const was = w.own[sid]; w.own[sid] = me.spid;
+          if (w.dmg[sid] >= w.mhp[sid]) { w.dead.add(sid); delete w.own[sid];
+            if (sid[0] === 'B') { const b = sid.slice(1); const B = w.boss[b] || (w.boss[b] = { gen: 0, deadUntil: 0 }); B.deadUntil = now + WBOSS_RESPAWN; }
+            else { const hk = clean(it[3], 24); const n = Math.max(1, Math.min(40, num(it[4], 1) | 0)); const H = w.h[hk] || (w.h[hk] = { gen: 0, killed: new Set(), respawnAt: 0 }); H.n = n; H.killed.add(sid); if (H.killed.size >= H.n && !H.respawnAt) H.respawnAt = now + HORDE_RESPAWN; }
+            mwRoomSend(k, { t: 'md', sid, k: me.spid, kn: me.nick }); }
+          else mwRoomSend(k, { t: 'mu', sid, hp: Math.round(w.mhp[sid] - w.dmg[sid]), o: me.spid }, was === me.spid ? me : null); }
+        break;
+      }
+      case 'mclaim': { const k = me.mwKey; if (!k) break; const w = mwOf(k); const sid = clean(d.sid, 40); if (!sid || w.dead.has(sid)) break; const o = w.own[sid]; if (o && o !== me.spid && bySpid(o)) break; w.own[sid] = me.spid; mwRoomSend(k, { t: 'mo', sid, o: me.spid }); break; }
+      case 'mrel': { const k = me.mwKey; if (!k) break; const w = mwOf(k); const sid = clean(d.sid, 40); if (w.own[sid] !== me.spid) break; delete w.own[sid]; if (!w.dead.has(sid)) { delete w.dmg[sid]; } mwRoomSend(k, { t: 'mo', sid, o: null, full: 1 }); break; }
+      case 'mp': { const k = me.mwKey; if (!k || !Array.isArray(d.l)) break; const w = MW.get(k); if (!w) break; const l = d.l.slice(0, 60).filter((x) => Array.isArray(x) && w.own[x[0]] === me.spid); if (l.length) mwRoomSend(k, { t: 'mp', l }, me); break; }
       case 'rk_me': { send(ws, { t: 'rk_me', r: RANK[me.pid] || {} }); break; }
       case 'pm': {
         const now = Date.now(); if (now - (me.lastChat || 0) < 700) return; me.lastChat = now;
@@ -682,7 +712,7 @@ wss.on('connection', (ws) => {
       }
     }
   });
-  ws.on('close', () => { me.gone = true; if (me.match) { const A = MATCHES.get(me.match); if (A) A.leave(me.spid); } if (me.party) { const pt0 = PARTIES.get(me.party); if (pt0 && pt0.st !== 'match') partyUnready(pt0); }
+  ws.on('close', () => { me.gone = true; try { mwReleaseAll(me, me.mwKey); } catch (e) {} if (me.match) { const A = MATCHES.get(me.match); if (A) A.leave(me.spid); } if (me.party) { const pt0 = PARTIES.get(me.party); if (pt0 && pt0.st !== 'match') partyUnready(pt0); }
   if (me.party) { const pid0 = me.party; clients.delete(ws); const pt = PARTIES.get(pid0); if (pt) { me.party = pid0; const keep = me.spid; pt.mem = pt.mem.filter((x) => x !== keep); me.party = null; if (pt.mem.length <= 1) { for (const s2 of pt.mem) { const w2 = bySpid(s2); if (w2) { clients.get(w2).party = null; send(w2, { t: 'pt', id: null, leader: null, mem: [] }); send(w2, { t: 'pt_msg', msg: 'A equipe foi desfeita.' }); } } PARTIES.delete(pt.id); } else { if (pt.leader === keep) pt.leader = pt.mem[0]; partyPush(pt, `${me.nick} saiu do jogo.`); } } }
   clients.delete(ws); if (me.ready) broadcast({ t: 'chat', ch: 'sys', text: `${me.nick} saiu do mundo.` }); });
 });
