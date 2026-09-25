@@ -55,6 +55,14 @@ setInterval(() => { const now = Date.now(); for (const b in SIEGE) { const s = S
 const SESSION_DAYS = 60;
 const passes = load('passes.json', { orders: {}, grants: {} }); // orders: id -> {acc, nick, mode, status, created, paid}; grants: acc -> {until, pending:[orderId]}
 const PASS_DAYS = 30;
+// ---------- Mercado Pix (dinheiro real entre jogadores) ----------
+const rmt = load('rmt.json', { next: 1, list: [], deliver: {} }); // list: {id, acc, seller, inst, price, st:'open'|'reserved'|'paid'|'done'|'cancel', buyer, buyerNick, until, t}
+const RMT_HOLD = 30 * 60 * 1000;
+const pixMask = (k) => { k = String(k || ''); return k.length <= 4 ? '****' : k.slice(0, 2) + '•••' + k.slice(-2); };
+function rmtTick() { const now = Date.now(); let ch = false; for (const l of rmt.list) if (l.st === 'reserved' && l.until < now) { l.st = 'open'; l.buyer = null; l.buyerNick = null; ch = true } if (ch) save('rmt.json', rmt); }
+setInterval(rmtTick, 30000);
+const rmtPub = (l, me) => ({ id: l.id, seller: l.seller, inst: l.inst, price: l.price, st: l.st, mine: !!me && l.acc === me.id, buying: !!me && l.buyer === me.id, buyerNick: me && l.acc === me.id ? l.buyerNick : undefined, until: l.until,
+  pix: me && l.buyer === me.id && (l.st === 'reserved' || l.st === 'paid') ? { key: (accounts[l.acc] && accounts[l.acc].pix || {}).key, name: (accounts[l.acc] && accounts[l.acc].pix || {}).name } : undefined });
 function grantPass(orderId) {
   const o = passes.orders[orderId]; if (!o || o.status === 'approved') return;
   o.status = 'approved'; o.paid = Date.now();
@@ -105,7 +113,7 @@ function upsert(id, provider, name) {
   const a = accounts[id] || (accounts[id] = { id, provider, name: '', nick: '', created: Date.now() });
   a.name = String(name || a.name || '').slice(0, 40); a.seen = Date.now(); save('accounts.json', accounts); return a;
 }
-const pubAcc = (a) => { const g = passes.grants[a.id]; return { provider: a.provider, name: a.name, nick: a.nick, hasSave: fs.existsSync(fileOf(a.id)), pass: g ? { until: g.until, pending: g.pending.length } : null }; };
+const pubAcc = (a) => { const g = passes.grants[a.id]; return { provider: a.provider, name: a.name, nick: a.nick, cls: a.cls || null, blk: a.blk || null, hasSave: fs.existsSync(fileOf(a.id)), pass: g ? { until: g.until, pending: g.pending.length } : null }; };
 
 // ---------- utilidades HTTP ----------
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.webp': 'image/webp', '.json': 'application/json' };
@@ -220,31 +228,73 @@ const server = http.createServer(async (req, res) => {
       if (id && CFG.mpToken) { const o = Object.values(passes.orders).find((x) => String(x.mpId) === String(id)); if (o) await mpCheck(o).catch(() => {}); }
       res.writeHead(200); return res.end('ok');
     }
+    if (req.method === 'POST' && p === '/api/blk') { const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' }); const b = await body(req); a.blk = Math.max(1, Math.min(4, num(b.blk, 1) | 0)); save('accounts.json', accounts); return json(res, 200, { blk: a.blk }); }
+    if (p.startsWith('/api/rmt/')) {
+      const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Entre com a sua conta.' });
+      rmtTick(); const act = p.slice(9); const b = req.method === 'POST' ? await body(req) : {};
+      const L = (id) => rmt.list.find((x) => x.id === +id);
+      if (act === 'list') return json(res, 200, { list: rmt.list.filter((l) => l.st === 'open' || l.st === 'reserved' || ((l.st === 'paid' || l.st === 'done') && (l.acc === a.id || l.buyer === a.id))).map((l) => rmtPub(l, a)), pix: a.pix ? { key: pixMask(a.pix.key), name: a.pix.name } : null, deliver: (rmt.deliver[a.id] || []).length });
+      if (act === 'pix') { const key = clean(b.key, 80).trim(), name = clean(b.name, 60).trim(); if (key.length < 5 || name.length < 3) return json(res, 400, { error: 'Informe a chave Pix e o nome do titular.' }); a.pix = { key, name }; save('accounts.json', accounts); return json(res, 200, { pix: { key: pixMask(key), name } }); }
+      if (act === 'sell') { if (!a.pix) return json(res, 400, { error: 'Cadastre a sua chave Pix antes de anunciar.' }); const inst = b.inst; const price = Math.round(num(b.price) * 100) / 100;
+        if (!inst || typeof inst !== 'object' || !inst.bal || !(inst.rar >= 3)) return json(res, 400, { error: 'Só itens com a balança podem ser vendidos por dinheiro.' });
+        if (price < 1 || price > 5000) return json(res, 400, { error: 'O preço deve ficar entre R$ 1,00 e R$ 5.000,00.' });
+        if (rmt.list.filter((l) => l.acc === a.id && (l.st === 'open' || l.st === 'reserved' || l.st === 'paid')).length >= 10) return json(res, 400, { error: 'Limite de 10 anúncios ativos.' });
+        const l = { id: rmt.next++, acc: a.id, seller: a.nick || a.name, inst, price, st: 'open', t: Date.now() }; rmt.list.push(l); save('rmt.json', rmt); return json(res, 200, { ok: true, id: l.id }); }
+      const l = L(b.id); if (!l) return json(res, 404, { error: 'Anúncio não encontrado.' });
+      if (act === 'cancel') { if (l.acc !== a.id || l.st !== 'open') return json(res, 400, { error: 'Só dá para retirar anúncios livres.' }); l.st = 'cancel'; save('rmt.json', rmt); return json(res, 200, { inst: l.inst }); }
+      if (act === 'reserve') { if (l.acc === a.id) return json(res, 400, { error: 'Esse anúncio é seu.' }); if (l.st !== 'open') return json(res, 400, { error: 'Outro jogador já está comprando este item.' });
+        if (rmt.list.some((x) => x.buyer === a.id && x.st === 'reserved')) return json(res, 400, { error: 'Termine ou cancele a sua compra reservada primeiro.' });
+        l.st = 'reserved'; l.buyer = a.id; l.buyerNick = a.nick || a.name; l.until = Date.now() + RMT_HOLD; save('rmt.json', rmt); return json(res, 200, { l: rmtPub(l, a) }); }
+      if (act === 'unreserve') { if (l.buyer !== a.id || l.st !== 'reserved') return json(res, 400, { error: 'Nada para cancelar.' }); l.st = 'open'; l.buyer = null; l.buyerNick = null; save('rmt.json', rmt); return json(res, 200, { ok: true }); }
+      if (act === 'paid') { if (l.buyer !== a.id || l.st !== 'reserved') return json(res, 400, { error: 'Reserva expirada. Reserve de novo.' }); l.st = 'paid'; l.paidAt = Date.now(); save('rmt.json', rmt);
+        const ws = byPid(l.acc); if (ws) send(ws, { t: 'rmt', msg: `${l.buyerNick} disse que pagou R$ ${l.price.toFixed(2).replace('.', ',')} pelo seu item. Confira o Pix e confirme no Mercado Pix.` }); return json(res, 200, { ok: true }); }
+      if (act === 'confirm') { if (l.acc !== a.id || l.st !== 'paid') return json(res, 400, { error: 'Nada para confirmar.' }); l.st = 'done'; l.doneAt = Date.now(); (rmt.deliver[l.buyer] || (rmt.deliver[l.buyer] = [])).push(l.inst); save('rmt.json', rmt);
+        const ws = byPid(l.buyer); if (ws) send(ws, { t: 'rmt', msg: 'O vendedor confirmou o seu Pix! O item foi entregue.', claim: 1 }); return json(res, 200, { ok: true }); }
+      if (act === 'deny') { if (l.acc !== a.id || l.st !== 'paid') return json(res, 400, { error: 'Nada para recusar.' }); l.st = 'dispute'; save('rmt.json', rmt); return json(res, 200, { ok: true, msg: 'Enviado para análise do administrador.' }); }
+      return json(res, 404, { error: 'Ação desconhecida.' });
+    }
+    if (p === '/api/rmtclaim') { const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' }); const d = rmt.deliver[a.id] || []; delete rmt.deliver[a.id]; save('rmt.json', rmt); return json(res, 200, { items: d }); }
     if (p === '/admin') {
       if (!CFG.adminKey || url.searchParams.get('key') !== CFG.adminKey) { res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }); return res.end('Acesso negado. Configure ADMIN_KEY no Render e abra /admin?key=SUA_CHAVE'); }
       const ap = url.searchParams.get('approve'); if (ap && passes.orders[ap]) grantPass(ap);
       const rj = url.searchParams.get('reject'); if (rj && passes.orders[rj] && passes.orders[rj].status !== 'approved') { passes.orders[rj].status = 'rejected'; save('passes.json', passes); }
+      const rc = url.searchParams.get('rmtok'), rx = url.searchParams.get('rmtno');
+      if (rc) { const l = rmt.list.find((x) => x.id === +rc); if (l && (l.st === 'paid' || l.st === 'dispute')) { l.st = 'done'; (rmt.deliver[l.buyer] || (rmt.deliver[l.buyer] = [])).push(l.inst); save('rmt.json', rmt); } }
+      if (rx) { const l = rmt.list.find((x) => x.id === +rx); if (l && (l.st === 'paid' || l.st === 'dispute')) { l.st = 'open'; l.buyer = null; l.buyerNick = null; save('rmt.json', rmt); } }
+      const K = encodeURIComponent(CFG.adminKey);
+      const rrows = rmt.list.filter((l) => l.st === 'paid' || l.st === 'dispute').map((l) => `<tr><td>#${l.id}</td><td>${String(l.seller).replace(/[<>&]/g, '')}</td><td>${String(l.buyerNick || '').replace(/[<>&]/g, '')}</td><td>R$ ${l.price.toFixed(2)}</td><td><b>${l.st}</b></td><td><a href="?key=${K}&rmtok=${l.id}">Entregar ao comprador</a> · <a href="?key=${K}&rmtno=${l.id}">Devolver ao anúncio</a></td></tr>`).join('');
       const rows = Object.values(passes.orders).sort((x, y) => y.created - x.created).slice(0, 200).map((o) => `<tr><td>${o.id}</td><td>${String(o.nick || '').replace(/[<>&]/g, '')}</td><td>R$ ${Number(o.amount).toFixed(2)}</td><td>${o.mode}</td><td><b>${o.status}</b></td><td>${new Date(o.created).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}</td><td>${o.status !== 'approved' ? `<a href="?key=${encodeURIComponent(CFG.adminKey)}&approve=${o.id}">Aprovar</a> · <a href="?key=${encodeURIComponent(CFG.adminKey)}&reject=${o.id}">Recusar</a>` : '✔'}</td></tr>`).join('');
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-      return res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin · Passes</title><style>body{font-family:system-ui;margin:20px;background:#f6ecd8;color:#2a1e14}table{border-collapse:collapse;width:100%;font-size:14px}td,th{border:1px solid #c8a070;padding:6px;text-align:left}th{background:#e8d4b0}</style><h1>Passes Mensais</h1><p>Pedidos "review" = o jogador disse que pagou. Confira no app do banco pelo código do pedido (aparece na descrição do Pix) e aprove.</p><table><tr><th>Pedido</th><th>Jogador</th><th>Valor</th><th>Modo</th><th>Status</th><th>Criado</th><th>Ação</th></tr>${rows}</table>`);
+      return res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin · Passes</title><style>body{font-family:system-ui;margin:20px;background:#f6ecd8;color:#2a1e14}table{border-collapse:collapse;width:100%;font-size:14px}td,th{border:1px solid #c8a070;padding:6px;text-align:left}th{background:#e8d4b0}</style><h1>Passes Mensais</h1><p>Pedidos "review" = o jogador disse que pagou. Confira no app do banco pelo código do pedido (aparece na descrição do Pix) e aprove.</p><h2>Mercado Pix — pagamentos a conferir</h2><table><tr><th>Anúncio</th><th>Vendedor</th><th>Comprador</th><th>Valor</th><th>Status</th><th>Ação</th></tr>${rrows || '<tr><td colspan=6>Nada pendente.</td></tr>'}</table><h2>Passes</h2><table><tr><th>Pedido</th><th>Jogador</th><th>Valor</th><th>Modo</th><th>Status</th><th>Criado</th><th>Ação</th></tr>${rows}</table>`);
     }
-    if (p === '/auth/config') return json(res, 200, { google: CFG.google || null, telegram: CFG.tgBot && CFG.tgToken ? CFG.tgBot : null, x: !!CFG.xId, guest: true });
+    if (p === '/auth/config') return json(res, 200, { google: CFG.google || null, telegram: CFG.tgBot && CFG.tgToken ? CFG.tgBot : null, x: !!CFG.xId, guest: process.env.ALLOW_GUEST === '1' });
     if (p === '/auth/x') return xStart(req, res);
     if (p === '/auth/x/callback') return xCallback(req, res, url);
     if (req.method === 'POST' && p === '/auth/google') { const b = await body(req); const a = await authGoogle(b.credential); return json(res, 200, { token: newSession(a.id), account: pubAcc(a) }); }
     if (req.method === 'POST' && p === '/auth/telegram') { const b = await body(req); const a = authTelegram(b.user); return json(res, 200, { token: newSession(a.id), account: pubAcc(a) }); }
     if (req.method === 'POST' && p === '/auth/guest') {
+      if (process.env.ALLOW_GUEST !== '1') return json(res, 403, { error: 'Entre com a sua conta Google.' });
       const b = await body(req); const gid = String(b.device || '').replace(/[^a-z0-9]/gi, '').slice(0, 40);
       if (gid.length < 10) return json(res, 400, { error: 'Dispositivo inválido.' });
       const a = upsert('guest:' + gid, 'guest', 'Convidado'); return json(res, 200, { token: newSession(a.id), account: pubAcc(a) });
     }
     if (p === '/api/me') { const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' }); return json(res, 200, { account: pubAcc(a), save: readSave(a.id) }); }
+    if (p === '/api/nick/check') {
+      const a = accountOf(tokenOf(req, url)); const n = cleanNick(url.searchParams.get('nick'));
+      if (n.length < 3) return json(res, 200, { ok: false, msg: 'Use pelo menos 3 letras.' });
+      if (!nickOk(n)) return json(res, 200, { ok: false, msg: 'Use só letras, números, espaço, ponto, traço ou _.' });
+      const taken = Object.values(accounts).some((o) => (!a || o.id !== a.id) && o.nick && o.nick.toLowerCase() === n.toLowerCase());
+      return json(res, 200, taken ? { ok: false, msg: 'Esse nick já está em uso.' } : { ok: true, msg: 'Nick disponível!' });
+    }
+    if (p === '/api/blocks') { const c = { 1: 0, 2: 0, 3: 0, 4: 0 }; for (const [, q] of clients) if (q.ready) c[q.b] = (c[q.b] || 0) + 1; return json(res, 200, { c }); }
     if (req.method === 'POST' && p === '/api/nick') {
       const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
       const b = await body(req); const n = cleanNick(b.nick); if (!nickOk(n)) return json(res, 400, { error: 'Nick inválido.' });
       const taken = Object.values(accounts).some((o) => o.id !== a.id && o.nick && o.nick.toLowerCase() === n.toLowerCase());
       if (taken) return json(res, 409, { error: 'Esse nick já está em uso. Escolha outro.' });
-      a.nick = n; save('accounts.json', accounts); return json(res, 200, { account: pubAcc(a) });
+      if (a.nick && a.nick !== n) return json(res, 409, { error: 'Este personagem já tem nick.' });
+      a.nick = n; if (b.cls) a.cls = clean(b.cls, 16); if (b.blk) a.blk = Math.max(1, Math.min(4, num(b.blk, 1) | 0));
+      save('accounts.json', accounts); return json(res, 200, { account: pubAcc(a) });
     }
     if (req.method === 'POST' && p === '/api/save') {
       const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
@@ -266,6 +316,7 @@ const server = http.createServer(async (req, res) => {
 // ---------- WebSocket ----------
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
 const clients = new Map();
+const GBOSS = {};
 const clean = (s, n) => String(s == null ? '' : s).replace(/[<>]/g, '').slice(0, n);
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
 function send(ws, msg) { if (ws.readyState === 1) ws.send(JSON.stringify(msg)); }
@@ -295,7 +346,7 @@ wss.on('connection', (ws) => {
       case 'pos':
         me.b = Math.max(1, Math.min(4, num(d.b, 1) | 0)); me.m = num(d.m, 0) | 0;
         me.x = num(d.x); me.y = num(d.y); me.dir = clean(d.dir, 1) || 'd'; me.mv = d.mv ? 1 : 0;
-        me.mount = clean(d.mount, 16); me.lvl = num(d.lvl, me.lvl);
+        me.mount = clean(d.mount, 16); me.lvl = num(d.lvl, me.lvl); me.wp = clean(d.wp, 16); me.sw = d.sw ? 1 : 0;
         if (d.guild !== undefined) me.guild = d.guild ? { name: clean(d.guild.name, 20), tag: clean(d.guild.tag, 4) } : null;
         break;
       case 'chat': {
@@ -334,6 +385,16 @@ wss.on('connection', (ws) => {
           }
         }
         s.dirty = true;
+        break;
+      }
+      case 'gb_on': case 'gb_list': case 'gb_done': {
+        const g = d.guild ? { name: clean(d.guild.name, 20), tag: clean(d.guild.tag, 4) } : me.guild; if (!g || !g.name) return; me.guild = g; const key = g.name.toLowerCase();
+        const L = GBOSS[key] || (GBOSS[key] = {}); const now = Date.now(); for (const k in L) if (L[k].until < now) delete L[k];
+        const bi = Math.max(0, Math.min(4, num(d.boss, 0) | 0)); let news = null;
+        if (d.t === 'gb_on') { L[bi] = { until: now + 30 * 60 * 1000, by: me.nick }; news = { boss: bi, by: me.nick } }
+        if (d.t === 'gb_done') delete L[bi];
+        const list = Object.entries(L).map(([k, v]) => ({ boss: +k, until: v.until, by: v.by }));
+        if (d.t === 'gb_list') send(ws, { t: 'gb', list }); else broadcast({ t: 'gb', list, news }, (q) => q.guild && q.guild.name && q.guild.name.toLowerCase() === key);
         break;
       }
       case 'cs_claim': {
@@ -434,7 +495,7 @@ setInterval(() => {
   for (const [ws, p] of clients) {
     if (!p.ready || ws.readyState !== 1) continue;
     const list = (rooms.get(p.b + ':' + p.m) || []).filter((o) => o !== p)
-      .map((o) => [o.spid, o.nick, Math.round(o.x), Math.round(o.y), o.dir, o.mv, o.lvl, o.guild ? o.guild.tag : '', o.guild ? o.guild.name : '', o.mount]);
+      .map((o) => [o.spid, o.nick, Math.round(o.x), Math.round(o.y), o.dir, o.mv, o.lvl, o.guild ? o.guild.tag : '', o.guild ? o.guild.name : '', o.mount, o.wp || '', o.sw || 0]);
     ws.send(JSON.stringify({ t: 'ps', p: list }));
   }
 }, 100);
