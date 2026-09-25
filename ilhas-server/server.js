@@ -346,7 +346,7 @@ wss.on('connection', (ws) => {
       case 'pos':
         me.b = Math.max(1, Math.min(4, num(d.b, 1) | 0)); me.m = num(d.m, 0) | 0;
         me.x = num(d.x); me.y = num(d.y); me.dir = clean(d.dir, 1) || 'd'; me.mv = d.mv ? 1 : 0;
-        me.mount = clean(d.mount, 16); me.lvl = num(d.lvl, me.lvl); me.wp = clean(d.wp, 16); me.sw = d.sw ? 1 : 0;
+        me.mount = clean(d.mount, 16); me.lvl = num(d.lvl, me.lvl); me.wp = clean(d.wp, 16); me.sw = d.sw ? 1 : 0; me.dn = d.dn ? 1 : 0; me.sk = clean(d.sk, 24);
         if (d.guild !== undefined) me.guild = d.guild ? { name: clean(d.guild.name, 20), tag: clean(d.guild.tag, 4) } : null;
         break;
       case 'chat': {
@@ -354,6 +354,10 @@ wss.on('connection', (ws) => {
         const text = clean(d.text, 140).trim(); if (!text) return;
         const ch = d.ch === 'local' ? 'local' : 'global';
         broadcast({ t: 'chat', ch, from: me.nick, gtag: me.guild ? me.guild.tag : '', b: me.b, text }, ch === 'local' ? (p) => p.b === me.b && p.m === me.m : null);
+        break;
+      }
+      case 'revive': case 'pull': {
+        for (const [ws2, p2] of clients) if (p2.spid === d.to && p2.b === me.b && p2.m === me.m) send(ws2, d.t === 'revive' ? { t: 'revived', from: me.nick } : { t: 'pulled', from: me.nick, x: num(d.x), y: num(d.y) });
         break;
       }
       case 'pvp': case 'pvp_ko': {
@@ -385,6 +389,10 @@ wss.on('connection', (ws) => {
           }
         }
         s.dirty = true;
+        break;
+      }
+      case 'rev': case 'pull': {
+        for (const [ws2, p2] of clients) if (p2.spid === d.to && p2.b === me.b && p2.m === me.m) send(ws2, d.t === 'rev' ? { t: 'rev', from: me.nick } : { t: 'pull', from: me.nick, x: num(d.x), y: num(d.y) });
         break;
       }
       case 'gb_on': case 'gb_list': case 'gb_done': {
@@ -460,6 +468,7 @@ wss.on('connection', (ws) => {
         if (!me.ready || price < 1 || price > 1e9) return send(ws, { t: 'mk_err', ref: d.ref, msg: 'Preço inválido.' });
         const l = { uid: market.next++, pid: me.pid, seller: me.nick, blk: me.b, price, cur: d.cur === 'ruby' ? 'ruby' : 'gold', kind: it.kind === 'eq' ? 'eq' : 'item', t: Date.now() };
         if (l.kind === 'eq') l.inst = it.inst; else { l.id = clean(it.id, 30); l.q = Math.max(1, num(it.q, 1) | 0); }
+        if ((l.id === 'sacoOuro' || l.id === 'pacoDark') && (l.cur !== 'ruby' || l.price < 2 * l.q)) return send(ws, { t: 'mk_err', ref: d.ref, msg: 'Sacolinha de Ouro e Pacote de Darkstill: venda só em rubis, mínimo 2 rubis cada.' });
         market.list.push(l); save('market.json', market);
         send(ws, { t: 'mk_listed', ref: d.ref }); broadcast({ t: 'market', list: publicMarket() });
         break;
@@ -476,7 +485,7 @@ wss.on('connection', (ws) => {
         const l = market.list[i]; if (l.pid === me.pid) return send(ws, { t: 'mk_err', msg: 'Você não pode comprar o seu próprio anúncio.' });
         market.list.splice(i, 1); save('market.json', market);
         send(ws, { t: 'mk_bought', l });
-        const net = Math.max(0, Math.floor(l.price * (1 - FEE)));
+        const net = (l.id === 'sacoOuro' || l.id === 'pacoDark') ? Math.floor(l.price / 2) : Math.max(0, Math.floor(l.price * (1 - FEE)));
         castle.tre[l.cur] = (castle.tre[l.cur] || 0) + (l.price - net); save('castle.json', castle); broadcast({ t: 'castle', c: pubCastle() });
         const sws = byPid(l.pid);
         if (sws) send(sws, { t: 'sold', l, net, buyer: me.nick });
@@ -495,7 +504,7 @@ setInterval(() => {
   for (const [ws, p] of clients) {
     if (!p.ready || ws.readyState !== 1) continue;
     const list = (rooms.get(p.b + ':' + p.m) || []).filter((o) => o !== p)
-      .map((o) => [o.spid, o.nick, Math.round(o.x), Math.round(o.y), o.dir, o.mv, o.lvl, o.guild ? o.guild.tag : '', o.guild ? o.guild.name : '', o.mount, o.wp || '', o.sw || 0]);
+      .map((o) => [o.spid, o.nick, Math.round(o.x), Math.round(o.y), o.dir, o.mv, o.lvl, o.guild ? o.guild.tag : '', o.guild ? o.guild.name : '', o.mount, o.wp || '', o.sw || 0, o.dn || 0, o.sk || '']);
     ws.send(JSON.stringify({ t: 'ps', p: list }));
   }
 }, 100);
