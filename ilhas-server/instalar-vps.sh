@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-#  Ilhas do Portal — instalação completa numa VPS (Ubuntu 22.04 ou 24.04)
+#  Ilhas do Portal — instalação completa numa VPS (Ubuntu 22.04, 24.04 ou 26.04 LTS)
 #
 #  Como usar (no terminal da VPS, logado como root):
 #    curl -fsSL https://raw.githubusercontent.com/edsonsantospronft-ship-it/Idle-NFT/main/ilhas-server/instalar-vps.sh | bash
@@ -9,7 +9,7 @@
 #
 #  O que ele faz, em ordem:
 #   1. Atualiza o Ubuntu e instala o básico (git, firewall).
-#   2. Instala o Node.js 20 (o "motor" que roda o server.js).
+#   2. Instala o Node.js 22 LTS (o "motor" que roda o server.js).
 #   3. Baixa o jogo do seu GitHub para /opt/ilhas.
 #   4. Cria a pasta de dados /var/lib/ilhas (contas, saves, rankings — NUNCA é apagada).
 #   5. Cria o arquivo de configuração /etc/ilhas.env (onde ficam chaves e tokens).
@@ -40,12 +40,17 @@ apt-get update -y
 apt-get upgrade -y
 apt-get install -y curl git ufw ca-certificates gnupg debian-keyring debian-archive-keyring apt-transport-https
 
-echo "==> 2/10 Instalando Node.js 20"
+echo "==> 2/10 Instalando Node.js 22 (LTS)"
 if ! command -v node >/dev/null || [ "$(node -v | cut -c2- | cut -d. -f1)" -lt 20 ]; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
+  # Caminho principal: repositório oficial do Node (funciona em Ubuntu 22.04, 24.04 e 26.04)
+  if ! (curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs); then
+    # Plano B: o Node que vem no próprio Ubuntu
+    echo "   NodeSource indisponível; usando o Node do Ubuntu"
+    apt-get install -y nodejs npm
+  fi
 fi
 node -v
+if [ "$(node -v | cut -c2- | cut -d. -f1)" -lt 18 ]; then echo "Node muito antigo ($(node -v)). Precisa do 18 ou mais novo."; exit 1; fi
 
 echo "==> 3/10 Baixando o jogo do GitHub"
 id ilhas >/dev/null 2>&1 || useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin ilhas
