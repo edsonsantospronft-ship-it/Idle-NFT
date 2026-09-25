@@ -67,11 +67,33 @@ const rmtPub = (l, me) => ({ id: l.id, seller: l.seller, inst: l.inst, price: l.
   pix: me && l.buyer === me.id && (l.st === 'reserved' || l.st === 'paid') ? { key: (accounts[l.acc] && accounts[l.acc].pix || {}).key, name: (accounts[l.acc] && accounts[l.acc].pix || {}).name } : undefined });
 function grantPass(orderId) {
   const o = passes.orders[orderId]; if (!o || o.status === 'approved') return;
+  if (o.kind === 'shop') { o.status = 'approved'; o.paid = Date.now(); (shop.inv[o.acc] || (shop.inv[o.acc] = [])).push({ oid: o.id, sku: o.sku }); save('passes.json', passes); save('shop.json', shop); const ws0 = byPid(o.acc); if (ws0) send(ws0, { t: 'shop_ok', sku: o.sku }); return; }
   o.status = 'approved'; o.paid = Date.now();
   const g = passes.grants[o.acc] || (passes.grants[o.acc] = { until: 0, pending: [] });
   g.until = Math.max(Date.now(), g.until || 0) + PASS_DAYS * 864e5; g.pending.push(orderId);
   save('passes.json', passes);
   const ws = byPid(o.acc); if (ws) send(ws, { t: 'pass_ok' });
+}
+// ---------- Loja (compras com Pix direto na loja do jogo) ----------
+const shop = load('shop.json', { inv: {} }); // inv: acc -> [{oid, sku}] baús pagos ainda não recebidos pelo jogo
+const SHOP_SKUS = {
+  bauSkin: { n: 'Baú de Skin', price: Number(process.env.PRICE_BAUSKIN || 29.90) },
+  bauHab9: { n: 'Baú de Habilidade x9', price: Number(process.env.PRICE_BAUHAB9 || 44.90) },
+  apoio: { n: 'Apoio ao Crescimento', price: Number(process.env.PRICE_APOIO || 59.90) },
+  bauAuto: { n: 'Baú Kit Automação', price: Number(process.env.PRICE_BAUAUTO || 39.90) },
+  tkColeta: { n: 'Baú Ticket de Coleta Automática', price: Number(process.env.PRICE_TKCOLETA || 25.00) },
+  tkHab: { n: 'Baú Ticket de Habilidade Automática', price: Number(process.env.PRICE_TKHAB || 25.00) },
+  tkAtq: { n: 'Baú Ticket de Ataque Automático', price: Number(process.env.PRICE_TKATQ || 25.00) },
+  tkPocao: { n: 'Baú Ticket de Poção Automática', price: Number(process.env.PRICE_TKPOCAO || 25.00) } };
+const pickW = (w) => { let t = 0; for (const k in w) t += w[k]; let x = Math.random() * t; for (const k in w) { x -= w[k]; if (x < 0) return +k; } return +Object.keys(w)[0]; };
+const RAR_W = { 0: 45, 1: 28, 2: 17, 3: 8, 4: 2 };          // Comum, Incomum, Raro, Épico, Lendário
+const SKIN_W = { 0: 55, 1: 30, 3: 12, 4: 3 };               // raridades das skins
+const GRADE_W = { 1: 40, 2: 30, 3: 18, 4: 9, 5: 3 };        // graus das habilidades
+function shopRoll(sku) {
+  if (sku === 'bauSkin') return { rar: pickW(SKIN_W), r: Math.random() };
+  if (sku === 'bauHab9') return { spins: Array.from({ length: 9 }, () => ({ g: pickW(GRADE_W), r: Math.random() })) };
+  if (sku === 'apoio') return {};
+  return { rar: pickW(RAR_W) };
 }
 // Pix estático (BR Code) com a chave do recebedor
 const emv = (id, v) => id + String(v.length).padStart(2, '0') + v;
@@ -82,8 +104,8 @@ function pixPayload(txid, amount) {
   let p = emv('00', '01') + emv('26', mai) + emv('52', '0000') + emv('53', '986') + emv('54', amount.toFixed(2)) + emv('58', 'BR') + emv('59', noAcc(CFG.pixName)) + emv('60', noAcc(CFG.pixCity)) + emv('62', emv('05', txid)) + '6304';
   return p + crc16(p);
 }
-async function mpCreate(orderId, acc, req) {
-  const body = { transaction_amount: CFG.passPrice, description: 'Passe Mensal - Ilhas do Portal', payment_method_id: 'pix', external_reference: orderId,
+async function mpCreate(orderId, acc, req, amount, desc) {
+  const body = { transaction_amount: amount || CFG.passPrice, description: desc || 'Passe Mensal - Ilhas do Portal', payment_method_id: 'pix', external_reference: orderId,
     payer: { email: 'jogador.' + crypto.createHash('sha1').update(acc.id).digest('hex').slice(0, 10) + '@ilhasdoportal.com' },
     notification_url: baseUrl(req) + '/api/pass/webhook' };
   const r = await fetch('https://api.mercadopago.com/v1/payments', { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + CFG.mpToken, 'x-idempotency-key': orderId }, body: JSON.stringify(body) });
@@ -197,6 +219,25 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       return res.end(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${priv ? 'Privacidade' : 'Termos'} · Ilhas do Portal</title><style>body{font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.6;color:#2a1e14;background:#f6ecd8}h1{font-size:24px}a{color:#8a4a1a}</style></head><body>${body}<p><a href="/">Voltar ao jogo</a></p></body></html>`);
     }
+    if (p === '/api/shop/info') return json(res, 200, { mode: CFG.mpToken ? 'auto' : CFG.pixKey ? 'manual' : null, items: Object.entries(SHOP_SKUS).map(([sku, v]) => ({ sku, n: v.n, price: v.price })) });
+    if (req.method === 'POST' && p === '/api/shop/create') {
+      const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Entre com uma conta para comprar na loja.' });
+      const b = await body(req); const it = SHOP_SKUS[b.sku]; if (!it) return json(res, 400, { error: 'Produto não encontrado.' });
+      const id = 'S' + Date.now().toString(36).toUpperCase() + crypto.randomBytes(3).toString('hex').toUpperCase();
+      const o = { id, acc: a.id, nick: a.nick, kind: 'shop', sku: b.sku, status: 'pending', created: Date.now(), amount: it.price };
+      if (CFG.mpToken) { const m = await mpCreate(id, a, req, it.price, it.n + ' - Ilhas do Portal'); Object.assign(o, { mode: 'auto', mpId: m.mpId }); passes.orders[id] = o; save('passes.json', passes); return json(res, 200, { id, mode: 'auto', code: m.code, img: m.img, amount: o.amount }); }
+      if (!CFG.pixKey) return json(res, 400, { error: 'O pagamento ainda não foi configurado pelo dono do jogo.' });
+      const code = pixPayload(id, o.amount); const img = QR ? await QR.toDataURL(code, { margin: 1, width: 320 }) : null;
+      Object.assign(o, { mode: 'manual' }); passes.orders[id] = o; save('passes.json', passes);
+      return json(res, 200, { id, mode: 'manual', code, img, amount: o.amount });
+    }
+    if (req.method === 'POST' && p === '/api/shop/claim') {
+      const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
+      const L = shop.inv[a.id] || []; if (!L.length) return json(res, 200, { chests: [] });
+      const chests = L.map((c) => Object.assign({ oid: c.oid, sku: c.sku }, shopRoll(c.sku))); delete shop.inv[a.id]; save('shop.json', shop);
+      for (const c of chests) { const o = passes.orders[c.oid]; if (o) { o.delivered = Date.now(); o.roll = c; } } save('passes.json', passes);
+      return json(res, 200, { chests });
+    }
     if (p === '/api/pass/info') return json(res, 200, { price: CFG.passPrice, mode: CFG.mpToken ? 'auto' : CFG.pixKey ? 'manual' : null, days: PASS_DAYS });
     if (req.method === 'POST' && p === '/api/pass/create') {
       const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Entre com uma conta para comprar o passe.' });
@@ -208,13 +249,13 @@ const server = http.createServer(async (req, res) => {
       Object.assign(o, { mode: 'manual' }); passes.orders[id] = o; save('passes.json', passes);
       return json(res, 200, { id, mode: 'manual', code, img, amount: o.amount });
     }
-    if (p === '/api/pass/status') {
+    if (p === '/api/pass/status' || p === '/api/shop/status') {
       const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
       const o = passes.orders[url.searchParams.get('id') || '']; if (!o || o.acc !== a.id) return json(res, 404, { error: 'Pedido não encontrado.' });
       if (o.mode === 'auto' && o.status !== 'approved') await mpCheck(o).catch(() => {});
       return json(res, 200, { status: passes.orders[o.id].status });
     }
-    if (req.method === 'POST' && p === '/api/pass/paid') {
+    if (req.method === 'POST' && (p === '/api/pass/paid' || p === '/api/shop/paid')) {
       const a = accountOf(tokenOf(req, url)); const b = await body(req); const o = passes.orders[b.id || ''];
       if (!a || !o || o.acc !== a.id) return json(res, 404, { error: 'Pedido não encontrado.' });
       if (o.status === 'pending') { o.status = 'review'; o.claimedPaid = Date.now(); save('passes.json', passes); }
@@ -225,7 +266,7 @@ const server = http.createServer(async (req, res) => {
       const g = passes.grants[a.id]; if (!g || !g.pending.length) return json(res, 200, { n: 0, until: g ? g.until : 0 });
       const n = g.pending.length; g.pending = []; save('passes.json', passes); return json(res, 200, { n, until: g.until });
     }
-    if (p === '/api/pass/webhook') {
+    if (p === '/api/pass/webhook' || p === '/api/shop/webhook') {
       let id = url.searchParams.get('data.id') || url.searchParams.get('id'); if (req.method === 'POST') { const b = await body(req).catch(() => ({})); id = id || (b.data && b.data.id); }
       if (id && CFG.mpToken) { const o = Object.values(passes.orders).find((x) => String(x.mpId) === String(id)); if (o) await mpCheck(o).catch(() => {}); }
       res.writeHead(200); return res.end('ok');
@@ -265,9 +306,9 @@ const server = http.createServer(async (req, res) => {
       if (rx) { const l = rmt.list.find((x) => x.id === +rx); if (l && (l.st === 'paid' || l.st === 'dispute')) { l.st = 'open'; l.buyer = null; l.buyerNick = null; save('rmt.json', rmt); } }
       const K = encodeURIComponent(CFG.adminKey);
       const rrows = rmt.list.filter((l) => l.st === 'paid' || l.st === 'dispute').map((l) => `<tr><td>#${l.id}</td><td>${String(l.seller).replace(/[<>&]/g, '')}</td><td>${String(l.buyerNick || '').replace(/[<>&]/g, '')}</td><td>R$ ${l.price.toFixed(2)}</td><td><b>${l.st}</b></td><td><a href="?key=${K}&rmtok=${l.id}">Entregar ao comprador</a> · <a href="?key=${K}&rmtno=${l.id}">Devolver ao anúncio</a></td></tr>`).join('');
-      const rows = Object.values(passes.orders).sort((x, y) => y.created - x.created).slice(0, 200).map((o) => `<tr><td>${o.id}</td><td>${String(o.nick || '').replace(/[<>&]/g, '')}</td><td>R$ ${Number(o.amount).toFixed(2)}</td><td>${o.mode}</td><td><b>${o.status}</b></td><td>${new Date(o.created).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}</td><td>${o.status !== 'approved' ? `<a href="?key=${encodeURIComponent(CFG.adminKey)}&approve=${o.id}">Aprovar</a> · <a href="?key=${encodeURIComponent(CFG.adminKey)}&reject=${o.id}">Recusar</a>` : '✔'}</td></tr>`).join('');
+      const rows = Object.values(passes.orders).sort((x, y) => y.created - x.created).slice(0, 200).map((o) => `<tr><td>${o.id}<br><small>${o.kind === 'shop' ? (SHOP_SKUS[o.sku] || {}).n || o.sku : 'Passe Mensal'}</small></td><td>${String(o.nick || '').replace(/[<>&]/g, '')}</td><td>R$ ${Number(o.amount).toFixed(2)}</td><td>${o.mode}</td><td><b>${o.status}</b></td><td>${new Date(o.created).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}</td><td>${o.status !== 'approved' ? `<a href="?key=${encodeURIComponent(CFG.adminKey)}&approve=${o.id}">Aprovar</a> · <a href="?key=${encodeURIComponent(CFG.adminKey)}&reject=${o.id}">Recusar</a>` : '✔'}</td></tr>`).join('');
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-      return res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin · Passes</title><style>body{font-family:system-ui;margin:20px;background:#f6ecd8;color:#2a1e14}table{border-collapse:collapse;width:100%;font-size:14px}td,th{border:1px solid #c8a070;padding:6px;text-align:left}th{background:#e8d4b0}</style><h1>Passes Mensais</h1><p>Pedidos "review" = o jogador disse que pagou. Confira no app do banco pelo código do pedido (aparece na descrição do Pix) e aprove.</p><h2>Mercado Pix — pagamentos a conferir</h2><table><tr><th>Anúncio</th><th>Vendedor</th><th>Comprador</th><th>Valor</th><th>Status</th><th>Ação</th></tr>${rrows || '<tr><td colspan=6>Nada pendente.</td></tr>'}</table><h2>Passes</h2><table><tr><th>Pedido</th><th>Jogador</th><th>Valor</th><th>Modo</th><th>Status</th><th>Criado</th><th>Ação</th></tr>${rows}</table>`);
+      return res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin · Passes</title><style>body{font-family:system-ui;margin:20px;background:#f6ecd8;color:#2a1e14}table{border-collapse:collapse;width:100%;font-size:14px}td,th{border:1px solid #c8a070;padding:6px;text-align:left}th{background:#e8d4b0}</style><h1>Passes Mensais e Loja</h1><p>Pedidos "review" = o jogador disse que pagou. Confira no app do banco pelo código do pedido (aparece na descrição do Pix) e aprove.</p><h2>Mercado Pix — pagamentos a conferir</h2><table><tr><th>Anúncio</th><th>Vendedor</th><th>Comprador</th><th>Valor</th><th>Status</th><th>Ação</th></tr>${rrows || '<tr><td colspan=6>Nada pendente.</td></tr>'}</table><h2>Passes</h2><table><tr><th>Pedido</th><th>Jogador</th><th>Valor</th><th>Modo</th><th>Status</th><th>Criado</th><th>Ação</th></tr>${rows}</table>`);
     }
     if (p === '/auth/config') return json(res, 200, { google: CFG.google || null, telegram: CFG.tgBot && CFG.tgToken ? CFG.tgBot : null, x: !!CFG.xId, guest: process.env.ALLOW_GUEST === '1' });
     if (p === '/auth/x') return xStart(req, res);
