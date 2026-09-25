@@ -79,12 +79,10 @@ const shop = load('shop.json', { inv: {} }); // inv: acc -> [{oid, sku}] baús p
 const SHOP_SKUS = {
   bauSkin: { n: 'Baú de Skin', price: Number(process.env.PRICE_BAUSKIN || 29.90) },
   bauHab9: { n: 'Baú de Habilidade x9', price: Number(process.env.PRICE_BAUHAB9 || 44.90) },
-  apoio: { n: 'Apoio ao Crescimento', price: Number(process.env.PRICE_APOIO || 59.90) },
-  bauAuto: { n: 'Baú Kit Automação', price: Number(process.env.PRICE_BAUAUTO || 39.90) },
-  tkColeta: { n: 'Baú Ticket de Coleta Automática', price: Number(process.env.PRICE_TKCOLETA || 25.00) },
-  tkHab: { n: 'Baú Ticket de Habilidade Automática', price: Number(process.env.PRICE_TKHAB || 25.00) },
-  tkAtq: { n: 'Baú Ticket de Ataque Automático', price: Number(process.env.PRICE_TKATQ || 25.00) },
-  tkPocao: { n: 'Baú Ticket de Poção Automática', price: Number(process.env.PRICE_TKPOCAO || 25.00) } };
+  apoio: { n: 'Apoio ao Crescimento', price: Number(process.env.PRICE_APOIO || 30.00) },
+  bauAuto: { n: 'Baú Kit Automação', price: Number(process.env.PRICE_BAUAUTO || 30.00) },
+  tkArena: { n: 'Baú Ticket da Arena', price: Number(process.env.PRICE_TKARENA || 45.00) },
+  tkBloco: { n: 'Baú Ticket de Mudança de Bloco', price: Number(process.env.PRICE_TKBLOCO || 45.00) } };
 const pickW = (w) => { let t = 0; for (const k in w) t += w[k]; let x = Math.random() * t; for (const k in w) { x -= w[k]; if (x < 0) return +k; } return +Object.keys(w)[0]; };
 const RAR_W = { 0: 45, 1: 28, 2: 17, 3: 8, 4: 2 };          // Comum, Incomum, Raro, Épico, Lendário
 const SKIN_W = { 0: 55, 1: 30, 3: 12, 4: 3 };               // raridades das skins
@@ -271,7 +269,7 @@ const server = http.createServer(async (req, res) => {
       if (id && CFG.mpToken) { const o = Object.values(passes.orders).find((x) => String(x.mpId) === String(id)); if (o) await mpCheck(o).catch(() => {}); }
       res.writeHead(200); return res.end('ok');
     }
-    if (req.method === 'POST' && p === '/api/blk') { const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' }); const b = await body(req); a.blk = Math.max(1, Math.min(4, num(b.blk, 1) | 0)); save('accounts.json', accounts); return json(res, 200, { blk: a.blk }); }
+    if (req.method === 'POST' && p === '/api/blk') { const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' }); const b = await body(req); a.blk = Math.max(1, Math.min(NBLK, num(b.blk, 1) | 0)); save('accounts.json', accounts); return json(res, 200, { blk: a.blk }); }
     if (p.startsWith('/api/rmt/')) {
       const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Entre com a sua conta.' });
       rmtTick(); const act = p.slice(9); const b = req.method === 'POST' ? await body(req) : {};
@@ -329,7 +327,7 @@ const server = http.createServer(async (req, res) => {
       const taken = Object.values(accounts).some((o) => (!a || o.id !== a.id) && o.nick && o.nick.toLowerCase() === n.toLowerCase());
       return json(res, 200, taken ? { ok: false, msg: 'Esse nick já está em uso.' } : { ok: true, msg: 'Nick disponível!' });
     }
-    if (p === '/api/blocks') { const c = { 1: 0, 2: 0, 3: 0, 4: 0 }; for (const [, q] of clients) if (q.ready) c[q.b] = (c[q.b] || 0) + 1; return json(res, 200, { c }); }
+    if (p === '/api/blocks') { return json(res, 200, { c: blockCounts(), cap: BLK_CAP, n: NBLK }); }
     if (req.method === 'POST' && p === '/api/rename') {
       const a = accountOf(tokenOf(req, url)); if (!a) return json(res, 401, { error: 'Sessão expirada.' });
       const b = await body(req); const n = cleanNick(b.nick); if (!nickOk(n)) return json(res, 400, { error: 'Nick inválido: use de 3 a 16 letras, números, espaço, ponto, traço ou _.' });
@@ -350,7 +348,7 @@ const server = http.createServer(async (req, res) => {
       const taken = Object.values(accounts).some((o) => o.id !== a.id && o.nick && o.nick.toLowerCase() === n.toLowerCase());
       if (taken) return json(res, 409, { error: 'Esse nick já está em uso. Escolha outro.' });
       if (a.nick && a.nick !== n) return json(res, 409, { error: 'Este personagem já tem nick.' });
-      a.nick = n; if (b.cls) a.cls = clean(b.cls, 16); if (b.blk) a.blk = Math.max(1, Math.min(4, num(b.blk, 1) | 0));
+      a.nick = n; if (b.cls) a.cls = clean(b.cls, 16); if (b.blk) a.blk = Math.max(1, Math.min(NBLK, num(b.blk, 1) | 0));
       save('accounts.json', accounts); return json(res, 200, { account: pubAcc(a) });
     }
     if (req.method === 'POST' && p === '/api/save') {
@@ -374,12 +372,14 @@ const server = http.createServer(async (req, res) => {
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
 const clients = new Map();
 const GBOSS = {};
+const NBLK = 36, REGION_SIZE = 12, BLK_CAP = Math.max(1, parseInt(process.env.BLOCK_CAP || '100', 10) || 100);
 const clean = (s, n) => String(s == null ? '' : s).replace(/[<>]/g, '').slice(0, n);
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
 function send(ws, msg) { if (ws.readyState === 1) ws.send(JSON.stringify(msg)); }
 function broadcast(msg, filter) { const s = JSON.stringify(msg); for (const [ws, p] of clients) if (ws.readyState === 1 && (!filter || filter(p))) ws.send(s); }
 function bySpid(spid) { for (const [ws, p] of clients) if (p.spid === spid && p.ready) return ws; return null; }
 const PARTIES = new Map(); let PARTY_SEQ = 0;
+function blockCounts() { const c = {}; for (let k = 1; k <= NBLK; k++) c[k] = 0; for (const [, q] of clients) if (q.ready && q.hadPos) c[q.b] = (c[q.b] || 0) + 1; return c; }
 const { createMatch } = require('./arena');
 const ARENA_TEAM = Math.max(1, Math.min(5, parseInt(process.env.ARENA_TEAM || '5', 10) || 5));
 const QUEUE = [], MATCHES = new Map(); let MATCH_SEQ = 0;
@@ -447,7 +447,14 @@ wss.on('connection', (ws) => {
         break;
       }
       case 'pos':
-        me.b = Math.max(1, Math.min(4, num(d.b, 1) | 0)); me.m = num(d.m, 0) | 0;
+        { const nb = Math.max(1, Math.min(NBLK, num(d.b, 1) | 0));
+          if (nb !== me.b || !me.hadPos) { let n = 0; for (const [, q] of clients) if (q !== me && q.ready && q.hadPos && q.b === nb) n++;
+            if (n >= BLK_CAP) { const cnt = blockCounts(); let best = null; const rg = Math.ceil(nb / REGION_SIZE); for (let k = (rg - 1) * REGION_SIZE + 1; k <= rg * REGION_SIZE; k++) if ((cnt[k] || 0) < BLK_CAP && (best === null || (cnt[k] || 0) < (cnt[best] || 0))) best = k;
+              if (!best) for (let k = 1; k <= NBLK; k++) if ((cnt[k] || 0) < BLK_CAP && (best === null || (cnt[k] || 0) < (cnt[best] || 0))) best = k;
+              if (me.hadPos) { send(ws, { t: 'blk_full', b: nb, cur: me.b, cap: BLK_CAP }); break; }
+              if (best) { me.b = best; me.hadPos = true; send(ws, { t: 'blk_full', b: nb, to: best, cap: BLK_CAP }); break; } }
+            me.b = nb; me.hadPos = true; } }
+        me.m = num(d.m, 0) | 0;
         me.x = num(d.x); me.y = num(d.y); me.dir = clean(d.dir, 1) || 'd'; me.mv = d.mv ? 1 : 0;
         me.mount = clean(d.mount, 16); me.lvl = num(d.lvl, me.lvl); me.wp = clean(d.wp, 16); me.sw = d.sw ? 1 : 0; me.dn = d.dn ? 1 : 0; me.sk = clean(d.sk, 24); me.cls = clean(d.cls, 16); me.hp = Math.max(0, Math.min(1, num(d.hp, 1))); me.pd = Math.max(1, Math.min(1e6, num(d.pd, 8)));
         if (d.pw != null && (!me.rkT || Date.now() - me.rkT > 10000)) { me.rkT = Date.now(); rkSet(me, 'pw', Math.max(0, Math.min(1e9, Math.floor(num(d.pw))))); rkSet(me, 'sk', Math.max(0, Math.min(1000, Math.floor(num(d.sc))))); rkSet(me, 'lv', Math.max(1, Math.min(9999, Math.floor(me.lvl || 1)))); }
@@ -458,7 +465,7 @@ wss.on('connection', (ws) => {
         const now = Date.now(); if (now - me.lastChat < 700) return; me.lastChat = now;
         const text = clean(d.text, 140).trim(); if (!text) return;
         const ch = d.ch === 'local' ? 'local' : 'global';
-        broadcast({ t: 'chat', ch, from: me.nick, gtag: me.guild ? me.guild.tag : '', b: me.b, text }, ch === 'local' ? (p) => p.b === me.b && p.m === me.m : null);
+        broadcast({ t: 'chat', ch, from: me.nick, gtag: me.guild ? me.guild.tag : '', b: me.b, text }, ch === 'local' ? (p) => p.b === me.b && p.m === me.m : (p) => Math.ceil(p.b / REGION_SIZE) === Math.ceil(me.b / REGION_SIZE));
         break;
       }
       // ---------- Equipe (grupo de até 5) ----------
@@ -692,9 +699,9 @@ setInterval(() => {
 }, 100);
 setInterval(() => { for (const pt of PARTIES.values()) partyPush(pt); }, 2000);
 setInterval(() => {
-  const c = { 1: 0, 2: 0, 3: 0, 4: 0 }; let total = 0;
+  const c = {}; for (let k = 1; k <= NBLK; k++) c[k] = 0; let total = 0;
   for (const [, p] of clients) if (p.ready) { c[p.b] = (c[p.b] || 0) + 1; total++; }
-  broadcast({ t: 'blocks', c, total });
+  broadcast({ t: 'blocks', c, total, cap: BLK_CAP });
 }, 2000);
 
 server.listen(PORT, () => {
